@@ -86,11 +86,11 @@ def main():
 
         cmd = [
             "python", "nerfstudio/scripts/train.py", "splatad",
+            "--viewer.quit-on-train-completion", "True",
             "argoverse2-data",
             "--data", "data/av2",
             "--split", "train",
             "--sequence", scene_id,
-            "--viewer.quit-on-train-completion", "True",
         ]
 
         env = os.environ.copy()
