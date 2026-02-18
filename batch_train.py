@@ -90,6 +90,7 @@ def main():
             "--data", "data/av2",
             "--split", "train",
             "--sequence", scene_id,
+            "--viewer.quit-on-train-completion", "True",
         ]
 
         env = os.environ.copy()
