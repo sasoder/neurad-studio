@@ -888,6 +888,8 @@ class DatasetRender(BaseRender):
     """Height to crop the output images at."""
     output_width: Optional[int] = None
     """Width to crop the output images at."""
+    max_images: Optional[int] = None
+    """Maximum number of images to render per split. If None, render all."""
 
     shift: Tuple[float, float, float] = (0, 0, 0)
     """Shift to apply to the camera pose."""
@@ -1008,6 +1010,8 @@ class DatasetRender(BaseRender):
                 TimeElapsedColumn(),
             ) as progress:
                 for camera_idx, (camera, batch) in enumerate(progress.track(dataloader, total=len(dataset))):
+                    if self.max_images is not None and camera_idx >= self.max_images:
+                        break
                     # Try to get the original filename
                     image_name = (
                         Path(dataparser_outputs.image_filenames[camera_idx]).with_suffix("").relative_to(images_root)
