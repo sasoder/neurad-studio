@@ -23,13 +23,14 @@ paradigm
 from __future__ import annotations
 
 import random
+import tempfile
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import Dict, ForwardRef, Generic, List, Literal, Optional, Tuple, Type, Union, cast, get_args, get_origin
+from typing import Any, Dict, ForwardRef, Generic, List, Literal, Optional, Tuple, Type, Union, cast, get_args, get_origin
 
 import cv2
 
@@ -53,6 +54,47 @@ from nerfstudio.utils.misc import get_orig_class
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
+class _DiskCachedImageData:
+    """Dict-like wrapper that stores the 'image' tensor on disk and loads it on demand.
+
+    All other keys are stored in memory as normal. This allows caching hundreds of
+    full-resolution images without running out of RAM.
+    """
+
+    def __init__(self, data: Dict[str, Any], image_path: Path, image_shape: torch.Size):
+        self._data = data
+        self._image_path = image_path
+        self._image_shape = image_shape
+
+    def __getitem__(self, key: str):
+        if key == "image":
+            return torch.load(self._image_path, map_location="cpu", weights_only=True)
+        return self._data[key]
+
+    def __setitem__(self, key: str, value: Any):
+        self._data[key] = value
+
+    def __contains__(self, key: str) -> bool:
+        return key == "image" or key in self._data
+
+    def copy(self) -> Dict[str, Any]:
+        """Return a plain dict with the image loaded from disk."""
+        result = self._data.copy()
+        result["image"] = torch.load(self._image_path, map_location="cpu", weights_only=True)
+        return result
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key == "image":
+            return torch.load(self._image_path, map_location="cpu", weights_only=True)
+        return self._data.get(key, default)
+
+    def keys(self):
+        return list(self._data.keys()) + ["image"]
+
+    def __iter__(self):
+        return iter(self.keys())
+
+
 @dataclass
 class FullImageDatamanagerConfig(DataManagerConfig):
     _target: Type = field(default_factory=lambda: FullImageDatamanager)
@@ -68,8 +110,10 @@ class FullImageDatamanagerConfig(DataManagerConfig):
     new images. If -1, never pick new images."""
     eval_image_indices: Optional[Tuple[int, ...]] = (0,)
     """Specifies the image indices to use during eval; if None, uses all."""
-    cache_images: Literal["cpu", "gpu"] = "gpu"
-    """Whether to cache images in memory. If "cpu", caches on cpu. If "gpu", caches on device."""
+    cache_images: Literal["cpu", "gpu", "disk"] = "gpu"
+    """Whether to cache images in memory. If "cpu", caches on cpu. If "gpu", caches on device.
+    If "disk", saves undistorted images to a temporary directory and loads them on demand,
+    which uses the least memory but is slightly slower per iteration."""
     cache_images_type: Literal["uint8", "float32"] = "float32"
     """The image type returned from manager, caching images in uint8 saves memory"""
     max_thread_workers: Optional[int] = None
@@ -128,10 +172,10 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         self.eval_dataset = self.create_eval_dataset()
         if len(self.train_dataset) > 500 and self.config.cache_images == "gpu":
             CONSOLE.print(
-                "Train dataset has over 500 images, overriding cache_images to cpu",
+                "Train dataset has over 500 images, overriding cache_images to disk to save memory",
                 style="bold yellow",
             )
-            self.config.cache_images = "cpu"
+            self.config.cache_images = "disk"
         self.exclude_batch_keys_from_device = self.train_dataset.exclude_batch_keys_from_device
         if self.config.masks_on_gpu is True:
             self.exclude_batch_keys_from_device.remove("mask")
@@ -195,7 +239,7 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         return self._load_images("eval", cache_images_device=self.config.cache_images)
 
     def _load_images(
-        self, split: Literal["train", "eval"], cache_images_device: Literal["cpu", "gpu"]
+        self, split: Literal["train", "eval"], cache_images_device: Literal["cpu", "gpu", "disk"]
     ) -> List[Dict[str, torch.Tensor]]:
         undistorted_images: List[Dict[str, torch.Tensor]] = []
 
@@ -236,6 +280,29 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
             dataset.cameras.width[idx] = image.shape[1]
             dataset.cameras.height[idx] = image.shape[0]
             return data
+
+        # Disk caching: undistort one image at a time and save to disk immediately,
+        # keeping only one image in memory at a time.
+        if cache_images_device == "disk":
+            if not hasattr(self, "_disk_cache_dir"):
+                self._disk_cache_dir = tempfile.TemporaryDirectory(prefix="neurad_image_cache_")
+            cache_dir = Path(self._disk_cache_dir.name) / split
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            CONSOLE.log(f"Caching / undistorting {split} images to disk: {cache_dir}")
+            for idx in track(
+                range(len(dataset)),
+                description=f"Caching / undistorting {split} images to disk",
+                transient=True,
+            ):
+                data = undistort_idx(idx)
+                image = data.pop("image")
+                image_path = cache_dir / f"{idx}.pt"
+                torch.save(image, image_path)
+                undistorted_images.append(_DiskCachedImageData(data, image_path, image.shape))
+                del image
+            self.train_cameras = self.train_dataset.cameras
+            return undistorted_images
 
         CONSOLE.log(f"Caching / undistorting {split} images")
         with ThreadPoolExecutor(max_workers=2) as executor:
