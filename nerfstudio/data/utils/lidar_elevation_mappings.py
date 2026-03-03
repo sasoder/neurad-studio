@@ -286,6 +286,22 @@ ARGOVERSE2_VELODYNE_VLP32C_ELEVATION_MAPPING = {
 
 VELODYNE_HDL32E_ELEVATION_MAPPING = dict(zip(np.arange(32), tuple(np.linspace(-30.67, 10.67, 32))))
 
+# Velodyne HDL-64E S2: 64 channels, +2.0° to -24.8° vertical FOV.
+# Upper block (32 beams): ~1/3° spacing, lower block (32 beams): ~1/2° spacing.
+VELODYNE_64E_ELEVATION_MAPPING = dict(
+    zip(
+        np.arange(64),
+        tuple(
+            np.concatenate(
+                [
+                    np.linspace(-24.8, -8.83, 32),  # lower block, ~0.515° spacing
+                    np.linspace(-8.33, 2.0, 32),  # upper block, ~0.333° spacing
+                ]
+            )
+        ),
+    )
+)
+
 WOD64_ELEVATION_MAPPING = {
     0: 2.5028389775650304,
     1: 2.321411751659905,
