@@ -53,6 +53,7 @@ class CameraType(Enum):
     VR180_R = auto()
     ORTHOPHOTO = auto()
     FISHEYE624 = auto()
+    MEI = auto()
 
 
 CAMERA_MODEL_TO_TYPE = {
@@ -69,6 +70,7 @@ CAMERA_MODEL_TO_TYPE = {
     "VR180_R": CameraType.VR180_R,
     "ORTHOPHOTO": CameraType.ORTHOPHOTO,
     "FISHEYE624": CameraType.FISHEYE624,
+    "MEI": CameraType.MEI,
 }
 
 
@@ -653,9 +655,12 @@ class Cameras(TensorDataclass):
             elif distortion_params_delta is not None:
                 distortion_params = distortion_params_delta
 
-            # Do not apply distortion for equirectangular images
+            # Do not apply distortion for equirectangular or MEI images (they handle it in their own unproject)
             if distortion_params is not None:
-                mask = (self.camera_type[true_indices] != CameraType.EQUIRECTANGULAR.value).squeeze(-1)  # (num_rays)
+                mask = (
+                    (self.camera_type[true_indices] != CameraType.EQUIRECTANGULAR.value)
+                    & (self.camera_type[true_indices] != CameraType.MEI.value)
+                ).squeeze(-1)  # (num_rays)
                 coord_mask = torch.stack([mask, mask, mask], dim=0)
                 if mask.any() and (distortion_params != 0).any():
                     coord_stack[coord_mask, :] = camera_utils.radial_and_tangential_undistort(
@@ -889,6 +894,29 @@ class Cameras(TensorDataclass):
                     dim=1,
                 )
                 directions_stack[coord_mask] = camera_utils.fisheye624_unproject(masked_coords, camera_params)
+
+            elif CameraType.MEI.value in cam_types:
+                mask = (self.camera_type[true_indices] == CameraType.MEI.value).squeeze(-1)
+                coord_mask = torch.stack([mask, mask, mask], dim=0)
+
+                pcoord = torch.stack([x, y], -1)
+                pcoord_x_offset = torch.stack([x + 1, y], -1)
+                pcoord_y_offset = torch.stack([x, y + 1], -1)
+                pcoord_stack = torch.stack([pcoord, pcoord_x_offset, pcoord_y_offset], dim=0)
+
+                assert distortion_params is not None
+                masked_coords = pcoord_stack[coord_mask, :]
+                camera_params = torch.cat(
+                    [
+                        fx[mask].unsqueeze(1),
+                        fy[mask].unsqueeze(1),
+                        cx[mask].unsqueeze(1),
+                        cy[mask].unsqueeze(1),
+                        distortion_params[mask, :],
+                    ],
+                    dim=1,
+                )
+                directions_stack[coord_mask] = camera_utils.mei_unproject(masked_coords, camera_params)
 
             else:
                 raise ValueError(f"Camera type {cam} not supported.")

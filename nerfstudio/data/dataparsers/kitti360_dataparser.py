@@ -15,6 +15,7 @@
 """Data parser for the KITTI-360 dataset."""
 
 import json
+import re
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -105,8 +106,10 @@ class Kitti360DataParserConfig(ADDataParserConfig):
         ...,
     ] = ("image_02", "image_03")
     """Which cameras to use."""
+    fisheye_camera_model: str = "mei"
+    """Camera model for fisheye cameras: 'mei' (native MEI) or 'pinhole' (pre-remapped)."""
     camera_data_subdir: str = "data_pinhole"
-    """Subdir under image_02/03 containing preprocessed pinhole fisheye images."""
+    """Subdir under image_02/03 containing preprocessed pinhole fisheye images (only used when fisheye_camera_model='pinhole')."""
     lidars: Tuple[Literal["velodyne", "none"], ...] = ("velodyne",)
     """Which lidars to use."""
     annotation_interval: float = 0.1
@@ -134,8 +137,12 @@ class Kitti360(ADDataParser):
         if "all" in self.config.cameras:
             self.config.cameras = AVAILABLE_CAMERAS
 
+        use_native_mei = self.config.fisheye_camera_model == "mei"
+
         filenames, times, poses, idxs = [], [], [], []
         fxs, fys, cxs, cys, heights, widths = [], [], [], [], [], []
+        cam_types: List[CameraType] = []
+        distortion_params_list: List[List[float]] = []
 
         for camera_idx, cam_name in enumerate(self.config.cameras):
             cam_id = int(cam_name.split("_")[1])
@@ -146,6 +153,30 @@ class Kitti360(ADDataParser):
                 intrinsics = self.P_rect[cam_id]
                 width = int(self.perspective_sizes[cam_id][0])
                 height = int(self.perspective_sizes[cam_id][1])
+                cam_type = CameraType.PERSPECTIVE
+                dist_params = [0.0] * 6
+                fx_val = float(intrinsics[0, 0])
+                fy_val = float(intrinsics[1, 1])
+                cx_val = float(intrinsics[0, 2])
+                cy_val = float(intrinsics[1, 2])
+            elif use_native_mei:
+                camera_folder = self.config.data / "data_2d_raw" / seq_name / cam_name / "data_rgb"
+                mei_params = _load_mei_calibration(self.config.data / "calibration" / f"image_{cam_id:02d}.yaml")
+                width = mei_params["image_width"]
+                height = mei_params["image_height"]
+                cam_type = CameraType.MEI
+                fx_val = mei_params["gamma1"]
+                fy_val = mei_params["gamma2"]
+                cx_val = mei_params["u0"]
+                cy_val = mei_params["v0"]
+                dist_params = [
+                    mei_params["xi"],
+                    mei_params["k1"],
+                    mei_params["k2"],
+                    mei_params["p1"],
+                    mei_params["p2"],
+                    0.0,
+                ]
             else:
                 camera_folder = self.config.data / "data_2d_raw" / seq_name / cam_name / self.config.camera_data_subdir
                 intrinsics_path = camera_folder / "intrinsics.json"
@@ -158,6 +189,12 @@ class Kitti360(ADDataParser):
                 intrinsics = fisheye_intrinsics["K"]
                 width = int(fisheye_intrinsics["width"])
                 height = int(fisheye_intrinsics["height"])
+                cam_type = CameraType.PERSPECTIVE
+                dist_params = [0.0] * 6
+                fx_val = float(intrinsics[0, 0])
+                fy_val = float(intrinsics[1, 1])
+                cx_val = float(intrinsics[0, 2])
+                cy_val = float(intrinsics[1, 2])
 
             if not camera_folder.exists():
                 raise FileNotFoundError(f"Camera folder not found: {camera_folder}")
@@ -175,8 +212,6 @@ class Kitti360(ADDataParser):
 
                 ego_pose = torch.from_numpy(self.frame_to_pose[frame_id].copy()).double()
 
-                # pose is imu2world, compute cam2world
-                # cam2world = imu2world @ cam2imu @ inv(R_rect)
                 cam2imu = torch.from_numpy(self.cam_to_pose[f"image_{cam_id:02d}"].copy()).double()
 
                 if cam_id in (0, 1):
@@ -191,12 +226,14 @@ class Kitti360(ADDataParser):
                 cam_pose[:3, :3] = cam_pose[:3, :3] @ torch.from_numpy(OPENCV_TO_NERFSTUDIO).double()
                 poses.append(cam_pose.float()[:3, :4])
                 idxs.append(camera_idx)
-                fxs.append(float(intrinsics[0, 0]))
-                fys.append(float(intrinsics[1, 1]))
-                cxs.append(float(intrinsics[0, 2]))
-                cys.append(float(intrinsics[1, 2]))
+                fxs.append(fx_val)
+                fys.append(fy_val)
+                cxs.append(cx_val)
+                cys.append(cy_val)
                 widths.append(width)
                 heights.append(height)
+                cam_types.append(cam_type)
+                distortion_params_list.append(dist_params)
 
         poses = torch.stack(poses)
         times = torch.tensor(times, dtype=torch.float64)
@@ -209,8 +246,9 @@ class Kitti360(ADDataParser):
             cy=torch.tensor(cys, dtype=torch.float32),
             height=torch.tensor(heights, dtype=torch.int32),
             width=torch.tensor(widths, dtype=torch.int32),
+            distortion_params=torch.tensor(distortion_params_list, dtype=torch.float32),
             camera_to_worlds=poses[:, :3, :4],
-            camera_type=CameraType.PERSPECTIVE,
+            camera_type=cam_types,
             times=times,
             metadata={"sensor_idxs": idxs},
         )
@@ -577,6 +615,39 @@ def _load_pinhole_intrinsics(filepath: Path) -> Dict[str, np.ndarray]:
         "width": int(data["width"]),
         "height": int(data["height"]),
     }
+
+
+def _load_mei_calibration(filepath: Path) -> Dict[str, float]:
+    """Load MEI omnidirectional camera calibration from KITTI-360 OpenCV YAML file."""
+    params: Dict[str, float] = {}
+    section = ""
+    kv_re = re.compile(r"^\s*([A-Za-z0-9_]+)\s*:\s*(.*)\s*$")
+
+    with open(filepath, "r") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("%YAML") or line.startswith("---"):
+                continue
+            m = kv_re.match(raw)
+            if not m:
+                continue
+            key, value = m.group(1), m.group(2).strip()
+            if value == "":
+                section = key
+            elif key in ("image_width", "image_height"):
+                params[key] = int(float(value))
+            elif section == "mirror_parameters" and key == "xi":
+                params["xi"] = float(value)
+            elif section == "distortion_parameters" and key in ("k1", "k2", "p1", "p2"):
+                params[key] = float(value)
+            elif section == "projection_parameters" and key in ("gamma1", "gamma2", "u0", "v0"):
+                params[key] = float(value)
+
+    required = {"image_width", "image_height", "xi", "k1", "k2", "p1", "p2", "gamma1", "gamma2", "u0", "v0"}
+    missing = required - set(params.keys())
+    if missing:
+        raise ValueError(f"Missing MEI calibration parameters in {filepath}: {missing}")
+    return params
 
 
 def _parse_opencv_matrix(node) -> np.ndarray:

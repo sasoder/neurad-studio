@@ -641,6 +641,24 @@ def _undistort_image(
             mask = mask[:, :, None]
         assert mask.shape == (undist_h, undist_w, 1)
         K = undist_K.numpy()
+    elif camera.camera_type.item() == CameraType.MEI.value:
+        # MEI distortion is handled during ray generation, not image undistortion.
+        # Build a validity mask so black corners outside the fisheye circle are ignored.
+        if "mask" in data:
+            mask = data["mask"]
+            if len(mask.shape) == 2:
+                mask = mask[:, :, None]
+        else:
+            h = int(camera.height.item())
+            w = int(camera.width.item())
+            cx = float(camera.cx.item())
+            cy = float(camera.cy.item())
+            radius = min(cx, cy, (w - 1) - cx, (h - 1) - cy)
+
+            yy, xx = np.mgrid[:h, :w]
+            radial = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+            mask_np = radial <= radius
+            mask = torch.from_numpy(mask_np)[..., None]
     else:
         raise NotImplementedError("Only perspective and fisheye cameras are supported")
 
