@@ -34,7 +34,6 @@ from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.data.utils.lidar_elevation_mappings import (
     PANDAR64_ELEVATION_MAPPING,
-    VELODYNE_64E_ELEVATION_MAPPING,
     VELODYNE_128_ELEVATION_MAPPING,
     VELODYNE_HDL32E_ELEVATION_MAPPING,
     VELODYNE_VLP32C_ELEVATION_MAPPING,
@@ -597,7 +596,7 @@ def get_lidar_elevation_mapping(lidar_type: LidarType) -> dict:
     elif lidar_type == LidarType.VELODYNE_VLP32C:
         return VELODYNE_VLP32C_ELEVATION_MAPPING
     elif lidar_type == LidarType.VELODYNE64E:
-        return VELODYNE_64E_ELEVATION_MAPPING
+        raise NotImplementedError("No elevation mapping for Velodyne 64E")
     elif lidar_type == LidarType.VELODYNE128:
         return VELODYNE_128_ELEVATION_MAPPING
     elif lidar_type == LidarType.PANDAR64:
