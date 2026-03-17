@@ -38,6 +38,7 @@ import plotly.graph_objs as go
 import torch
 import tyro
 import viser.transforms as tf
+from av2.datasets.sensor.av2_sensor_dataloader import AV2SensorDataLoader
 from jaxtyping import Float
 from rich import box, style
 from rich.panel import Panel
@@ -52,22 +53,27 @@ from nerfstudio.cameras.camera_paths import (
     get_path_from_json,
     get_spiral_path,
 )
+from nerfstudio.cameras.camera_utils import rotmat_to_unitquat
 from nerfstudio.cameras.cameras import Cameras, CameraType, RayBundle
 from nerfstudio.cameras.lidars import transform_points
 from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager, VanillaDataManagerConfig
 from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig
 from nerfstudio.data.datamanagers.parallel_datamanager import ParallelDataManager
 from nerfstudio.data.datamanagers.random_cameras_datamanager import RandomCamerasDataManager
+from nerfstudio.data.dataparsers.ad_dataparser import OPENCV_TO_NERFSTUDIO
 from nerfstudio.data.datasets.base_dataset import Dataset
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.data.utils.dataloaders import FixedIndicesEvalDataloader
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.model_components import renderers
 from nerfstudio.pipelines.base_pipeline import Pipeline
+from nerfstudio.utils import poses as pose_utils
 from nerfstudio.utils import colormaps, install_checks
 from nerfstudio.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE, ItersPerSecColumn
 from nerfstudio.utils.scripts import run_command
+
+AV2_SPLITS = ("train", "val", "test", "mini", "mini_val", "mini_test")
 
 
 def _render_trajectory_video(
@@ -439,6 +445,230 @@ class BaseRender:
     """Whether to render the nearest training camera to the rendered camera."""
     check_occlusions: bool = False
     """If true, checks line-of-sight occlusions when computing camera distance and rejects cameras not visible to each other"""
+
+
+def _infer_scene_id_from_load_config(load_config: Path) -> str:
+    """Infer the AV2 scene id from outputs/.../splatad/{scene_id}/{timestamp}/config.yml."""
+    if load_config.name != "config.yml":
+        raise ValueError(f"Expected load_config to point to config.yml, got {load_config}")
+    scene_id = load_config.parent.parent.name
+    if not scene_id:
+        raise ValueError(f"Could not infer scene id from {load_config}")
+    return scene_id
+
+
+def _resolve_av2_split_root(
+    data_root: Path, sequence: str, split: Optional[Literal["train", "val", "test", "mini", "mini_val", "mini_test"]]
+) -> Tuple[Path, str]:
+    candidate_splits = [split] if split is not None else list(AV2_SPLITS)
+    for candidate in candidate_splits:
+        split_root = data_root / "sensor" / candidate
+        if (split_root / sequence).exists():
+            return split_root, candidate
+    raise FileNotFoundError(f"Could not find AV2 sequence {sequence} under {data_root / 'sensor'}")
+
+
+def _slice_frame_paths(paths: List[Path], start_frame: int, max_frames: Optional[int]) -> List[Path]:
+    if start_frame < 0:
+        raise ValueError("start_frame must be >= 0")
+    end_frame = None if max_frames is None else start_frame + max_frames
+    selected = paths[start_frame:end_frame]
+    if not selected:
+        raise ValueError("Selected frame range is empty")
+    return selected
+
+
+def _infer_video_seconds_from_times(times: torch.Tensor) -> float:
+    if times.numel() <= 1:
+        return 1.0
+    deltas = times[1:, 0] - times[:-1, 0]
+    positive_deltas = deltas[deltas > 0]
+    if positive_deltas.numel() == 0:
+        return float(times.shape[0])
+    fps = 1.0 / torch.median(positive_deltas).item()
+    return times.shape[0] / fps
+
+
+def _build_av2_target_cameras(
+    dataloader: AV2SensorDataLoader,
+    sequence: str,
+    target_camera: str,
+    image_paths: List[Path],
+    world_transform: torch.Tensor,
+    time_offset: float,
+    appearance_sensor_idx: int,
+    rolling_shutter_time: float,
+    time_to_center_pixel: float,
+) -> Tuple[Cameras, List[int]]:
+    pinhole_camera = dataloader.get_log_pinhole_camera(sequence, target_camera)
+    camera_extrinsics = pinhole_camera.ego_SE3_cam.transform_matrix.copy()
+    camera_extrinsics[:3, :3] = camera_extrinsics[:3, :3] @ OPENCV_TO_NERFSTUDIO
+
+    timestamps_ns: List[int] = []
+    poses = []
+    relative_times = []
+    for image_path in image_paths:
+        timestamp_ns = int(image_path.stem)
+        ego_to_world = dataloader.get_city_SE3_ego(sequence, timestamp_ns)
+        raw_camera_to_world = torch.tensor(ego_to_world.transform_matrix @ camera_extrinsics, dtype=torch.float32)
+        poses.append((world_transform @ raw_camera_to_world)[:3, :4].float())
+        timestamps_ns.append(timestamp_ns)
+        relative_times.append((timestamp_ns / 1e9) - time_offset)
+
+    intrinsics = pinhole_camera.intrinsics.K
+    num_frames = len(image_paths)
+    poses_tensor = torch.stack(poses, dim=0).float()
+    times_tensor = torch.tensor(relative_times, dtype=torch.float32).unsqueeze(-1)
+    velocities = torch.zeros((num_frames, 3), dtype=torch.float32)
+    linear_velocities_local = torch.zeros((num_frames, 3), dtype=torch.float32)
+    angular_velocities_local = torch.zeros((num_frames, 3), dtype=torch.float32)
+    if num_frames > 1:
+        translation_velo = (poses_tensor[1:, :3, 3] - poses_tensor[:-1, :3, 3]) / (times_tensor[1:] - times_tensor[:-1])
+        next_cam = poses_tensor[1:]
+        prev_cam = poses_tensor[:-1]
+        next_cam_in_prev_cam = pose_utils.to4x4(pose_utils.inverse(prev_cam)) @ pose_utils.to4x4(next_cam)
+        translation_velo_cam_ref = next_cam_in_prev_cam[:, :3, 3] / (times_tensor[1:] - times_tensor[:-1])
+        angular_velo = pose_utils.rotation_difference(poses_tensor[:-1, :3, :3], poses_tensor[1:, :3, :3]) / (
+            times_tensor[1:] - times_tensor[:-1]
+        )
+        velocities = torch.cat((translation_velo, translation_velo[-1:]), 0).float()
+        linear_velocities_local = torch.cat((translation_velo_cam_ref, translation_velo_cam_ref[-1:]), 0).float()
+        angular_velocities_local = torch.cat((angular_velo, angular_velo[-1:]), 0).float()
+
+    cameras = Cameras(
+        camera_to_worlds=poses_tensor,
+        fx=torch.full((num_frames, 1), float(intrinsics[0, 0]), dtype=torch.float32),
+        fy=torch.full((num_frames, 1), float(intrinsics[1, 1]), dtype=torch.float32),
+        cx=torch.full((num_frames, 1), float(intrinsics[0, 2]), dtype=torch.float32),
+        cy=torch.full((num_frames, 1), float(intrinsics[1, 2]), dtype=torch.float32),
+        width=torch.full((num_frames, 1), int(pinhole_camera.intrinsics.width_px), dtype=torch.int64),
+        height=torch.full((num_frames, 1), int(pinhole_camera.intrinsics.height_px), dtype=torch.int64),
+        camera_type=CameraType.PERSPECTIVE,
+        times=times_tensor,
+        metadata={
+            "sensor_idxs": torch.full((num_frames, 1), appearance_sensor_idx, dtype=torch.int64),
+            "timestamp_ns": torch.tensor(timestamps_ns, dtype=torch.int64).unsqueeze(-1),
+            "velocities": velocities,
+            "linear_velocities_local": linear_velocities_local,
+            "angular_velocities_local": angular_velocities_local,
+            "rolling_shutter_time": torch.full((num_frames, 1), rolling_shutter_time, dtype=torch.float32),
+            "time_to_center_pixel": torch.full((num_frames, 1), time_to_center_pixel, dtype=torch.float32),
+        },
+    )
+    return cameras, timestamps_ns
+
+
+def _get_av2_camera_to_worlds(
+    dataloader: AV2SensorDataLoader,
+    sequence: str,
+    camera_name: str,
+    timestamps_ns: List[int],
+    world_transform: torch.Tensor,
+) -> torch.Tensor:
+    pinhole_camera = dataloader.get_log_pinhole_camera(sequence, camera_name)
+    camera_extrinsics = pinhole_camera.ego_SE3_cam.transform_matrix.copy()
+    camera_extrinsics[:3, :3] = camera_extrinsics[:3, :3] @ OPENCV_TO_NERFSTUDIO
+
+    poses = []
+    for timestamp_ns in timestamps_ns:
+        ego_to_world = dataloader.get_city_SE3_ego(sequence, timestamp_ns)
+        raw_camera_to_world = torch.tensor(ego_to_world.transform_matrix @ camera_extrinsics, dtype=torch.float32)
+        poses.append((world_transform @ raw_camera_to_world)[:3, :4].float())
+    return torch.stack(poses, dim=0)
+
+
+def _compute_reference_camera_delta(
+    reference_camera_to_worlds: torch.Tensor,
+    target_camera_to_worlds: torch.Tensor,
+    timestamps_ns: List[int],
+) -> Dict[str, Any]:
+    ref_to_target = pose_utils.multiply(pose_utils.inverse(reference_camera_to_worlds), target_camera_to_worlds)
+    quaternions_xyzw = rotmat_to_unitquat(ref_to_target[:, :3, :3]).float()
+
+    first_translation = ref_to_target[0, :3, 3]
+    translation_deviation = (ref_to_target[:, :3, 3] - first_translation).norm(dim=-1)
+    first_rotation = ref_to_target[0, :3, :3].unsqueeze(0).expand(ref_to_target.shape[0], -1, -1)
+    rotation_deviation_rad = pose_utils.rotation_difference(first_rotation, ref_to_target[:, :3, :3]).norm(dim=-1)
+    rotation_deviation_deg = torch.rad2deg(rotation_deviation_rad)
+
+    per_frame = []
+    for idx, timestamp_ns in enumerate(timestamps_ns):
+        per_frame.append(
+            {
+                "timestamp_ns": int(timestamp_ns),
+                "translation_xyz_m": [float(v) for v in ref_to_target[idx, :3, 3].tolist()],
+                "quaternion_xyzw": [float(v) for v in quaternions_xyzw[idx].tolist()],
+                "camera_to_camera_3x4": [[float(v) for v in row] for row in ref_to_target[idx].tolist()],
+            }
+        )
+
+    return {
+        "translation_xyz_m_first": [float(v) for v in first_translation.tolist()],
+        "quaternion_xyzw_first": [float(v) for v in quaternions_xyzw[0].tolist()],
+        "max_translation_deviation_m": float(translation_deviation.max().item()),
+        "max_rotation_deviation_deg": float(rotation_deviation_deg.max().item()),
+        "per_frame": per_frame,
+    }
+
+
+def _rename_rendered_images_to_timestamps(
+    output_path: Path, image_format: Literal["jpeg", "png"], timestamps_ns: List[int]
+) -> Path:
+    image_suffix = ".png" if image_format == "png" else ".jpg"
+    output_dir = output_path.parent / output_path.stem
+    for frame_idx, timestamp_ns in enumerate(timestamps_ns):
+        source = output_dir / f"{frame_idx:05d}{image_suffix}"
+        target = output_dir / f"{timestamp_ns}{image_suffix}"
+        if not source.exists():
+            raise FileNotFoundError(f"Expected rendered frame {source} was not created")
+        source.rename(target)
+    return output_dir
+
+
+def _resolve_av2_output_path(
+    output_path: Path,
+    output_format: Literal["images", "video"],
+    scene_id: str,
+    target_camera: str,
+) -> Path:
+    if output_path != BaseRender.output_path:
+        return output_path
+    if output_format == "video":
+        return Path("renders") / scene_id / f"{target_camera}.mp4"
+    return Path("renders") / scene_id / target_camera
+
+
+def _write_av2_render_manifest(
+    manifest_path: Path,
+    *,
+    load_config: Path,
+    sequence: str,
+    data_split: str,
+    target_camera: str,
+    appearance_sensor: str,
+    reference_camera: Optional[str],
+    timestamps_ns: List[int],
+    image_paths: List[Path],
+    relative_times: torch.Tensor,
+    sensor_idx_to_name: Dict[int, str],
+    reference_delta: Optional[Dict[str, Any]] = None,
+) -> None:
+    manifest = {
+        "load_config": str(load_config),
+        "sequence": sequence,
+        "data_split": data_split,
+        "target_camera": target_camera,
+        "appearance_sensor": appearance_sensor,
+        "reference_camera": reference_camera,
+        "num_frames": len(timestamps_ns),
+        "timestamps_ns": timestamps_ns,
+        "source_images": [str(path) for path in image_paths],
+        "relative_times_seconds": [float(value) for value in relative_times[:, 0].tolist()],
+        "sensor_idx_to_name": {str(idx): name for idx, name in sensor_idx_to_name.items()},
+    }
+    if reference_delta is not None:
+        manifest["reference_to_target_delta"] = reference_delta
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
 @dataclass
@@ -1191,6 +1421,155 @@ class DatasetRender(BaseRender):
         CONSOLE.print(Panel(table, title="[bold][green]:tada: Render on split {} Complete :tada:[/bold]", expand=False))
 
 
+@dataclass
+class RenderAV2TargetCamera(BaseRender):
+    """Render an optimized scene from an AV2 target camera trajectory."""
+
+    sequence: str = ""
+    """AV2 sequence UUID to render. Defaults to the scene id inferred from load_config."""
+
+    target_camera: str = "stereo_front_right"
+    """AV2 camera stream to use for intrinsics and poses."""
+
+    appearance_sensor: str = "ring_front_right"
+    """Training camera whose appearance embedding should be reused."""
+
+    reference_camera: Optional[str] = None
+    """Optional camera used when exporting rigid camera-to-camera deltas. Defaults to appearance_sensor."""
+
+    data_root: Path = Path("data/av2")
+    """Root directory containing the AV2 dataset."""
+
+    split: Optional[Literal["train", "val", "test", "mini", "mini_val", "mini_test"]] = None
+    """Dataset split override. If omitted, infer the split by searching the dataset."""
+
+    start_frame: int = 0
+    """First frame index to render."""
+
+    max_frames: Optional[int] = None
+    """Maximum number of frames to render."""
+
+    output_format: Literal["images", "video"] = "images"
+    """How to save output data."""
+
+    video_seconds: Optional[float] = None
+    """Override video duration. If omitted, infer it from AV2 timestamps."""
+
+    def main(self) -> None:
+        scene_id = _infer_scene_id_from_load_config(self.load_config)
+        sequence = self.sequence or scene_id
+        self.output_path = _resolve_av2_output_path(self.output_path, self.output_format, scene_id, self.target_camera)
+
+        _, pipeline, _, _ = eval_setup(
+            self.load_config,
+            eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+            test_mode="inference",
+            update_config_callback=streamline_ad_config,
+            strict_load=False,
+        )
+
+        dataparser_outputs = pipeline.datamanager.train_dataparser_outputs
+        sensor_idx_to_name = dataparser_outputs.metadata["sensor_idx_to_name"]
+        sensor_name_to_idx = {name: idx for idx, name in sensor_idx_to_name.items()}
+        if self.appearance_sensor not in sensor_name_to_idx:
+            available = ", ".join(sensor_name_to_idx)
+            raise ValueError(f"appearance_sensor {self.appearance_sensor!r} not found. Available sensors: {available}")
+
+        split_root, data_split = _resolve_av2_split_root(self.data_root, sequence, self.split)
+        dataloader = AV2SensorDataLoader(split_root, split_root)
+        image_paths = dataloader.get_ordered_log_cam_fpaths(sequence, self.target_camera)
+        selected_image_paths = _slice_frame_paths(image_paths, self.start_frame, self.max_frames)
+
+        world_transform = pose_utils.to4x4(dataparser_outputs.dataparser_transform).cpu().float()
+        time_offset = float(dataparser_outputs.time_offset)
+        appearance_sensor_idx = int(sensor_name_to_idx[self.appearance_sensor])
+        dataparser_config = pipeline.datamanager.dataparser.config
+        cameras, timestamps_ns = _build_av2_target_cameras(
+            dataloader=dataloader,
+            sequence=sequence,
+            target_camera=self.target_camera,
+            image_paths=selected_image_paths,
+            world_transform=world_transform,
+            time_offset=time_offset,
+            appearance_sensor_idx=appearance_sensor_idx,
+            rolling_shutter_time=float(dataparser_config.rolling_shutter_time),
+            time_to_center_pixel=float(dataparser_config.time_to_center_pixel),
+        )
+        reference_camera = self.reference_camera or self.appearance_sensor
+        reference_delta = None
+        if reference_camera:
+            reference_camera_to_worlds = _get_av2_camera_to_worlds(
+                dataloader=dataloader,
+                sequence=sequence,
+                camera_name=reference_camera,
+                timestamps_ns=timestamps_ns,
+                world_transform=world_transform,
+            )
+            reference_delta = _compute_reference_camera_delta(
+                reference_camera_to_worlds=reference_camera_to_worlds,
+                target_camera_to_worlds=cameras.camera_to_worlds,
+                timestamps_ns=timestamps_ns,
+            )
+
+        CONSOLE.print(
+            f"Rendering {len(selected_image_paths)} frames from {self.target_camera} using {self.appearance_sensor} appearance"
+        )
+        CONSOLE.print(f"First timestamp: {timestamps_ns[0]}, last timestamp: {timestamps_ns[-1]}, split: {data_split}")
+        if reference_delta is not None:
+            CONSOLE.print(
+                f"{reference_camera} -> {self.target_camera} translation (m): "
+                f"{reference_delta['translation_xyz_m_first']}"
+            )
+            CONSOLE.print(
+                f"{reference_camera} -> {self.target_camera} max drift: "
+                f"{reference_delta['max_translation_deviation_m']:.6f} m, "
+                f"{reference_delta['max_rotation_deviation_deg']:.6f} deg"
+            )
+
+        if self.output_format == "video" and str(self.output_path.suffix) == "":
+            self.output_path = self.output_path.with_suffix(".mp4")
+
+        seconds = self.video_seconds if self.video_seconds is not None else _infer_video_seconds_from_times(cameras.times)
+        _render_trajectory_video(
+            pipeline,
+            cameras,
+            output_filename=self.output_path,
+            rendered_output_names=self.rendered_output_names,
+            rendered_resolution_scaling_factor=1.0 / self.downscale_factor,
+            seconds=seconds,
+            output_format=self.output_format,
+            image_format=self.image_format,
+            jpeg_quality=self.jpeg_quality,
+            depth_near_plane=self.depth_near_plane,
+            depth_far_plane=self.depth_far_plane,
+            colormap_options=self.colormap_options,
+            render_nearest_camera=self.render_nearest_camera,
+            check_occlusions=self.check_occlusions,
+        )
+
+        if self.output_format == "images":
+            manifest_dir = _rename_rendered_images_to_timestamps(self.output_path, self.image_format, timestamps_ns)
+            manifest_path = manifest_dir / "render_manifest.json"
+        else:
+            manifest_path = self.output_path.with_suffix(".manifest.json")
+
+        _write_av2_render_manifest(
+            manifest_path,
+            load_config=self.load_config,
+            sequence=sequence,
+            data_split=data_split,
+            target_camera=self.target_camera,
+            appearance_sensor=self.appearance_sensor,
+            reference_camera=reference_camera,
+            timestamps_ns=timestamps_ns,
+            image_paths=selected_image_paths,
+            relative_times=cameras.times,
+            sensor_idx_to_name={int(idx): name for idx, name in sensor_idx_to_name.items()},
+            reference_delta=reference_delta,
+        )
+        CONSOLE.print(f"[bold][green]:glowing_star: Render manifest saved to {manifest_path}")
+
+
 def plot_lidar_points(points, output_path, cmin=-6.0, cmax=5.0, width=1920, height=1080, ranges=[100, 200, 10]):
     x = points[:, 0]
     y = points[:, 1]
@@ -1275,6 +1654,7 @@ Commands = tyro.conf.FlagConversionOff[
         Annotated[RenderInterpolated, tyro.conf.subcommand(name="interpolate")],
         Annotated[SpiralRender, tyro.conf.subcommand(name="spiral")],
         Annotated[DatasetRender, tyro.conf.subcommand(name="dataset")],
+        Annotated[RenderAV2TargetCamera, tyro.conf.subcommand(name="av2-target-camera")],
     ]
 ]
 
