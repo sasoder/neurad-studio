@@ -889,6 +889,7 @@ class Cameras(TensorDataclass):
                     dim=1,
                 )
                 directions_stack[coord_mask] = camera_utils.fisheye624_unproject(masked_coords, camera_params)
+                
             else:
                 raise ValueError(f"Camera type {cam} not supported.")
 
