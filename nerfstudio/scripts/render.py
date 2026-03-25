@@ -40,6 +40,7 @@ import tyro
 import viser.transforms as tf
 from av2.datasets.sensor.av2_sensor_dataloader import AV2SensorDataLoader
 from jaxtyping import Float
+from PIL import Image
 from rich import box, style
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
@@ -74,6 +75,10 @@ from nerfstudio.utils.rich_utils import CONSOLE, ItersPerSecColumn
 from nerfstudio.utils.scripts import run_command
 
 AV2_SPLITS = ("train", "val", "test", "mini", "mini_val", "mini_test")
+DEFAULT_AV2_STEREO_APPEARANCE_SENSORS = {
+    "stereo_front_left": "ring_front_left",
+    "stereo_front_right": "ring_front_right",
+}
 
 
 def _render_trajectory_video(
@@ -457,6 +462,62 @@ def _infer_scene_id_from_load_config(load_config: Path) -> str:
     return scene_id
 
 
+def _get_default_stereo_sidecar_path(load_config: Path) -> Path:
+    return load_config.parent / "nerfstudio_models" / "stereo_appearance.pt"
+
+
+def _get_default_av2_appearance_sensor(target_camera: str) -> str:
+    return DEFAULT_AV2_STEREO_APPEARANCE_SENSORS.get(target_camera, "ring_front_right")
+
+
+def _load_stereo_appearance_sidecar(sidecar_path: Path) -> Dict[str, Any]:
+    sidecar = torch.load(sidecar_path, map_location="cpu")
+    if not isinstance(sidecar, dict) or "entries" not in sidecar:
+        raise ValueError(f"Invalid stereo appearance sidecar: {sidecar_path}")
+    return sidecar
+
+
+def _get_sidecar_appearance_embedding(
+    sidecar: Dict[str, Any], target_camera: str, appearance_dim: int
+) -> Optional[torch.Tensor]:
+    entries = sidecar.get("entries", {})
+    if target_camera not in entries:
+        return None
+    embedding = entries[target_camera].get("embedding")
+    if embedding is None:
+        raise ValueError(f"Stereo appearance sidecar entry for {target_camera} is missing an embedding.")
+    embedding = torch.as_tensor(embedding, dtype=torch.float32)
+    if embedding.ndim != 1 or embedding.shape[0] != appearance_dim:
+        raise ValueError(
+            f"Stereo appearance sidecar entry for {target_camera} has shape {tuple(embedding.shape)}, "
+            f"expected ({appearance_dim},)."
+        )
+    return embedding
+
+
+def _save_stereo_appearance_sidecar(
+    sidecar_path: Path,
+    *,
+    load_config: Path,
+    sequence: str,
+    appearance_dim: int,
+    entries: Dict[str, Dict[str, Any]],
+    fit_settings: Dict[str, Any],
+) -> None:
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "format": "splatad_stereo_appearance_v1",
+            "load_config": str(load_config),
+            "sequence": sequence,
+            "appearance_dim": appearance_dim,
+            "entries": entries,
+            "fit_settings": fit_settings,
+        },
+        sidecar_path,
+    )
+
+
 def _resolve_av2_split_root(
     data_root: Path, sequence: str, split: Optional[Literal["train", "val", "test", "mini", "mini_val", "mini_test"]]
 ) -> Tuple[Path, str]:
@@ -499,6 +560,7 @@ def _build_av2_target_cameras(
     appearance_sensor_idx: int,
     rolling_shutter_time: float,
     time_to_center_pixel: float,
+    appearance_embedding: Optional[torch.Tensor] = None,
 ) -> Tuple[Cameras, List[int]]:
     pinhole_camera = dataloader.get_log_pinhole_camera(sequence, target_camera)
     camera_extrinsics = pinhole_camera.ego_SE3_cam.transform_matrix.copy()
@@ -535,6 +597,19 @@ def _build_av2_target_cameras(
         linear_velocities_local = torch.cat((translation_velo_cam_ref, translation_velo_cam_ref[-1:]), 0).float()
         angular_velocities_local = torch.cat((angular_velo, angular_velo[-1:]), 0).float()
 
+    metadata = {
+        "sensor_idxs": torch.full((num_frames, 1), appearance_sensor_idx, dtype=torch.int64),
+        "timestamp_ns": torch.tensor(timestamps_ns, dtype=torch.int64).unsqueeze(-1),
+        "velocities": velocities,
+        "linear_velocities_local": linear_velocities_local,
+        "angular_velocities_local": angular_velocities_local,
+        "rolling_shutter_time": torch.full((num_frames, 1), rolling_shutter_time, dtype=torch.float32),
+        "time_to_center_pixel": torch.full((num_frames, 1), time_to_center_pixel, dtype=torch.float32),
+    }
+    if appearance_embedding is not None:
+        appearance_embedding = appearance_embedding.float()
+        metadata["appearance_embedding"] = appearance_embedding.unsqueeze(0).repeat(num_frames, 1)
+
     cameras = Cameras(
         camera_to_worlds=poses_tensor,
         fx=torch.full((num_frames, 1), float(intrinsics[0, 0]), dtype=torch.float32),
@@ -545,15 +620,7 @@ def _build_av2_target_cameras(
         height=torch.full((num_frames, 1), int(pinhole_camera.intrinsics.height_px), dtype=torch.int64),
         camera_type=CameraType.PERSPECTIVE,
         times=times_tensor,
-        metadata={
-            "sensor_idxs": torch.full((num_frames, 1), appearance_sensor_idx, dtype=torch.int64),
-            "timestamp_ns": torch.tensor(timestamps_ns, dtype=torch.int64).unsqueeze(-1),
-            "velocities": velocities,
-            "linear_velocities_local": linear_velocities_local,
-            "angular_velocities_local": angular_velocities_local,
-            "rolling_shutter_time": torch.full((num_frames, 1), rolling_shutter_time, dtype=torch.float32),
-            "time_to_center_pixel": torch.full((num_frames, 1), time_to_center_pixel, dtype=torch.float32),
-        },
+        metadata=metadata,
     )
     return cameras, timestamps_ns
 
@@ -652,6 +719,8 @@ def _write_av2_render_manifest(
     relative_times: torch.Tensor,
     sensor_idx_to_name: Dict[int, str],
     reference_delta: Optional[Dict[str, Any]] = None,
+    appearance_sidecar: Optional[Path] = None,
+    used_fitted_appearance: bool = False,
 ) -> None:
     manifest = {
         "load_config": str(load_config),
@@ -665,10 +734,36 @@ def _write_av2_render_manifest(
         "source_images": [str(path) for path in image_paths],
         "relative_times_seconds": [float(value) for value in relative_times[:, 0].tolist()],
         "sensor_idx_to_name": {str(idx): name for idx, name in sensor_idx_to_name.items()},
+        "used_fitted_appearance": used_fitted_appearance,
     }
+    if appearance_sidecar is not None:
+        manifest["appearance_sidecar"] = str(appearance_sidecar)
     if reference_delta is not None:
         manifest["reference_to_target_delta"] = reference_delta
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def _load_av2_rgb_image(image_path: Path, height: int, width: int) -> torch.Tensor:
+    image = np.asarray(Image.open(image_path), dtype=np.float32)
+    if image.ndim == 2:
+        image = np.repeat(image[..., None], 3, axis=-1)
+    image = torch.from_numpy(image[..., :3] / 255.0)
+    image = image[:height, :width]
+    if image.shape[0] != height or image.shape[1] != width:
+        image = torch.nn.functional.interpolate(
+            image.permute(2, 0, 1).unsqueeze(0),
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )[0].permute(1, 2, 0)
+    return image
+
+
+def _set_camera_appearance_override(camera: Cameras, appearance_embedding: torch.Tensor) -> Cameras:
+    camera.metadata = camera.metadata or {}
+    camera.metadata["appearance_embedding"] = appearance_embedding.float().unsqueeze(0)
+    return camera
 
 
 @dataclass
@@ -1434,6 +1529,9 @@ class RenderAV2TargetCamera(BaseRender):
     appearance_sensor: str = "ring_front_right"
     """Training camera whose appearance embedding should be reused."""
 
+    appearance_sidecar: Optional[Path] = None
+    """Optional sidecar file containing fitted stereo appearance embeddings."""
+
     reference_camera: Optional[str] = None
     """Optional camera used when exporting rigid camera-to-camera deltas. Defaults to appearance_sensor."""
 
@@ -1471,6 +1569,8 @@ class RenderAV2TargetCamera(BaseRender):
         dataparser_outputs = pipeline.datamanager.train_dataparser_outputs
         sensor_idx_to_name = dataparser_outputs.metadata["sensor_idx_to_name"]
         sensor_name_to_idx = {name: idx for idx, name in sensor_idx_to_name.items()}
+        if self.appearance_sensor == "ring_front_right" and self.target_camera in DEFAULT_AV2_STEREO_APPEARANCE_SENSORS:
+            self.appearance_sensor = _get_default_av2_appearance_sensor(self.target_camera)
         if self.appearance_sensor not in sensor_name_to_idx:
             available = ", ".join(sensor_name_to_idx)
             raise ValueError(f"appearance_sensor {self.appearance_sensor!r} not found. Available sensors: {available}")
@@ -1483,6 +1583,14 @@ class RenderAV2TargetCamera(BaseRender):
         world_transform = pose_utils.to4x4(dataparser_outputs.dataparser_transform).cpu().float()
         time_offset = float(dataparser_outputs.time_offset)
         appearance_sensor_idx = int(sensor_name_to_idx[self.appearance_sensor])
+        appearance_override = None
+        used_fitted_appearance = False
+        if self.appearance_sidecar is not None:
+            sidecar = _load_stereo_appearance_sidecar(self.appearance_sidecar)
+            appearance_override = _get_sidecar_appearance_embedding(
+                sidecar, self.target_camera, pipeline.model.config.appearance_dim
+            )
+            used_fitted_appearance = appearance_override is not None
         dataparser_config = pipeline.datamanager.dataparser.config
         cameras, timestamps_ns = _build_av2_target_cameras(
             dataloader=dataloader,
@@ -1494,6 +1602,7 @@ class RenderAV2TargetCamera(BaseRender):
             appearance_sensor_idx=appearance_sensor_idx,
             rolling_shutter_time=float(dataparser_config.rolling_shutter_time),
             time_to_center_pixel=float(dataparser_config.time_to_center_pixel),
+            appearance_embedding=appearance_override,
         )
         reference_camera = self.reference_camera or self.appearance_sensor
         reference_delta = None
@@ -1514,6 +1623,8 @@ class RenderAV2TargetCamera(BaseRender):
         CONSOLE.print(
             f"Rendering {len(selected_image_paths)} frames from {self.target_camera} using {self.appearance_sensor} appearance"
         )
+        if used_fitted_appearance:
+            CONSOLE.print(f"Using fitted appearance override from {self.appearance_sidecar}")
         CONSOLE.print(f"First timestamp: {timestamps_ns[0]}, last timestamp: {timestamps_ns[-1]}, split: {data_split}")
         if reference_delta is not None:
             CONSOLE.print(
@@ -1566,8 +1677,216 @@ class RenderAV2TargetCamera(BaseRender):
             relative_times=cameras.times,
             sensor_idx_to_name={int(idx): name for idx, name in sensor_idx_to_name.items()},
             reference_delta=reference_delta,
+            appearance_sidecar=self.appearance_sidecar,
+            used_fitted_appearance=used_fitted_appearance,
         )
         CONSOLE.print(f"[bold][green]:glowing_star: Render manifest saved to {manifest_path}")
+
+
+@dataclass
+class FitAV2StereoAppearance:
+    """Fit stereo-only appearance vectors for an AV2 scene without changing the base checkpoint."""
+
+    load_config: Path
+    """Path to the base config YAML file."""
+
+    output_path: Optional[Path] = None
+    """Optional sidecar output path. Defaults to <run-dir>/stereo_appearance.pt."""
+
+    sequence: str = ""
+    """AV2 sequence UUID to fit. Defaults to the scene id inferred from load_config."""
+
+    target_cameras: Tuple[str, ...] = ("stereo_front_left", "stereo_front_right")
+    """AV2 camera streams to fit appearance vectors for."""
+
+    appearance_sensors: Tuple[str, ...] = tuple()
+    """Optional donor sensors used to initialize each target camera embedding."""
+
+    data_root: Path = Path("data/av2")
+    """Root directory containing the AV2 dataset."""
+
+    split: Optional[Literal["train", "val", "test", "mini", "mini_val", "mini_test"]] = None
+    """Dataset split override. If omitted, infer the split by searching the dataset."""
+
+    start_frame: int = 0
+    """First frame index to use for fitting."""
+
+    max_frames: Optional[int] = 24
+    """Maximum number of frames to use per stereo camera."""
+
+    downscale_factor: float = 4.0
+    """Downscale factor applied during fitting."""
+
+    max_steps: int = 400
+    """Number of optimization steps."""
+
+    learning_rate: float = 5e-2
+    """Learning rate for the stereo appearance vectors."""
+
+    eval_num_rays_per_chunk: Optional[int] = None
+    """Optional eval chunk size override."""
+
+    log_every: int = 25
+    """How often to print progress."""
+
+    seed: int = 42
+    """Random seed for frame sampling."""
+
+    def main(self) -> None:
+        scene_id = _infer_scene_id_from_load_config(self.load_config)
+        sequence = self.sequence or scene_id
+        output_path = self.output_path or _get_default_stereo_sidecar_path(self.load_config)
+
+        torch.manual_seed(self.seed)
+
+        _, pipeline, _, _ = eval_setup(
+            self.load_config,
+            eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+            test_mode="inference",
+            update_config_callback=streamline_ad_config,
+            strict_load=False,
+        )
+
+        model = pipeline.model
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad_(False)
+
+        if not hasattr(model, "appearance_embedding"):
+            raise TypeError("Stereo appearance fitting currently only supports models with an appearance_embedding table.")
+
+        appearance_dim = int(model.config.appearance_dim)
+        dataparser_outputs = pipeline.datamanager.train_dataparser_outputs
+        sensor_idx_to_name = dataparser_outputs.metadata["sensor_idx_to_name"]
+        sensor_name_to_idx = {name: idx for idx, name in sensor_idx_to_name.items()}
+        split_root, data_split = _resolve_av2_split_root(self.data_root, sequence, self.split)
+        dataloader = AV2SensorDataLoader(split_root, split_root)
+        world_transform = pose_utils.to4x4(dataparser_outputs.dataparser_transform).cpu().float()
+        time_offset = float(dataparser_outputs.time_offset)
+        dataparser_config = pipeline.datamanager.dataparser.config
+
+        if self.appearance_sensors and len(self.appearance_sensors) != len(self.target_cameras):
+            raise ValueError("appearance_sensors must be empty or have the same length as target_cameras.")
+
+        donor_by_camera = {
+            target_camera: (
+                self.appearance_sensors[idx]
+                if self.appearance_sensors
+                else _get_default_av2_appearance_sensor(target_camera)
+            )
+            for idx, target_camera in enumerate(self.target_cameras)
+        }
+
+        camera_sets: Dict[str, Dict[str, Any]] = {}
+        appearance_params = torch.nn.ParameterDict()
+        for target_camera in self.target_cameras:
+            donor_sensor = donor_by_camera[target_camera]
+            if donor_sensor not in sensor_name_to_idx:
+                available = ", ".join(sensor_name_to_idx)
+                raise ValueError(f"appearance sensor {donor_sensor!r} not found. Available sensors: {available}")
+
+            image_paths = dataloader.get_ordered_log_cam_fpaths(sequence, target_camera)
+            selected_image_paths = _slice_frame_paths(image_paths, self.start_frame, self.max_frames)
+            donor_sensor_idx = int(sensor_name_to_idx[donor_sensor])
+            cameras, timestamps_ns = _build_av2_target_cameras(
+                dataloader=dataloader,
+                sequence=sequence,
+                target_camera=target_camera,
+                image_paths=selected_image_paths,
+                world_transform=world_transform,
+                time_offset=time_offset,
+                appearance_sensor_idx=donor_sensor_idx,
+                rolling_shutter_time=float(dataparser_config.rolling_shutter_time),
+                time_to_center_pixel=float(dataparser_config.time_to_center_pixel),
+            )
+            if self.downscale_factor != 1.0:
+                cameras.rescale_output_resolution(1.0 / self.downscale_factor)
+
+            gt_images = [
+                _load_av2_rgb_image(image_path, int(cameras.height[idx].item()), int(cameras.width[idx].item()))
+                for idx, image_path in enumerate(selected_image_paths)
+            ]
+            init_embedding = model.appearance_embedding.weight[donor_sensor_idx].detach().clone().to(model.device)
+            appearance_params[target_camera] = torch.nn.Parameter(init_embedding)
+            camera_sets[target_camera] = {
+                "cameras": cameras,
+                "gt_images": gt_images,
+                "timestamps_ns": timestamps_ns,
+                "image_paths": selected_image_paths,
+                "donor_sensor": donor_sensor,
+            }
+
+        optimizer = torch.optim.Adam(appearance_params.parameters(), lr=self.learning_rate)
+        camera_names = list(camera_sets)
+
+        def evaluate_mean_l1() -> Dict[str, float]:
+            metrics = {}
+            with torch.no_grad():
+                for target_camera, data in camera_sets.items():
+                    losses = []
+                    for idx, gt_image in enumerate(data["gt_images"]):
+                        camera = _set_camera_appearance_override(
+                            data["cameras"][idx : idx + 1], appearance_params[target_camera].detach()
+                        )
+                        outputs = model.get_outputs(camera.to(model.device))
+                        losses.append(torch.abs(outputs["rgb"] - gt_image.to(model.device)).mean().item())
+                    metrics[target_camera] = float(np.mean(losses))
+            return metrics
+
+        baseline_l1 = evaluate_mean_l1()
+        CONSOLE.print(f"Fitting stereo appearance for {sequence} on split {data_split}")
+        for target_camera, value in baseline_l1.items():
+            donor_sensor = camera_sets[target_camera]["donor_sensor"]
+            CONSOLE.print(f"Initial mean L1 for {target_camera} (init from {donor_sensor}): {value:.6f}")
+
+        for step in range(1, self.max_steps + 1):
+            target_camera = camera_names[torch.randint(len(camera_names), size=(1,)).item()]
+            data = camera_sets[target_camera]
+            frame_idx = torch.randint(len(data["gt_images"]), size=(1,)).item()
+            camera = _set_camera_appearance_override(data["cameras"][frame_idx : frame_idx + 1], appearance_params[target_camera])
+            gt_image = data["gt_images"][frame_idx].to(model.device)
+            outputs = model.get_outputs(camera.to(model.device))
+            loss = model.get_loss_dict(outputs, {"image": gt_image})["main_loss"]
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            if step % self.log_every == 0 or step == 1 or step == self.max_steps:
+                CONSOLE.print(f"Step {step}/{self.max_steps}: {target_camera} frame {frame_idx} L1={loss.item():.6f}")
+
+        fitted_l1 = evaluate_mean_l1()
+        entries = {}
+        for target_camera in self.target_cameras:
+            entries[target_camera] = {
+                "embedding": appearance_params[target_camera].detach().cpu(),
+                "init_from": camera_sets[target_camera]["donor_sensor"],
+                "baseline_mean_l1": baseline_l1[target_camera],
+                "fitted_mean_l1": fitted_l1[target_camera],
+                "num_frames": len(camera_sets[target_camera]["gt_images"]),
+            }
+
+        _save_stereo_appearance_sidecar(
+            output_path,
+            load_config=self.load_config,
+            sequence=sequence,
+            appearance_dim=appearance_dim,
+            entries=entries,
+            fit_settings={
+                "data_root": str(self.data_root),
+                "data_split": data_split,
+                "target_cameras": list(self.target_cameras),
+                "start_frame": self.start_frame,
+                "max_frames": self.max_frames,
+                "downscale_factor": self.downscale_factor,
+                "max_steps": self.max_steps,
+                "learning_rate": self.learning_rate,
+                "seed": self.seed,
+            },
+        )
+        CONSOLE.print(f"[bold][green]:glowing_star: Stereo appearance sidecar saved to {output_path}")
+        for target_camera, value in fitted_l1.items():
+            CONSOLE.print(f"Fitted mean L1 for {target_camera}: {value:.6f} (baseline {baseline_l1[target_camera]:.6f})")
 
 
 def plot_lidar_points(points, output_path, cmin=-6.0, cmax=5.0, width=1920, height=1080, ranges=[100, 200, 10]):
@@ -1655,6 +1974,7 @@ Commands = tyro.conf.FlagConversionOff[
         Annotated[SpiralRender, tyro.conf.subcommand(name="spiral")],
         Annotated[DatasetRender, tyro.conf.subcommand(name="dataset")],
         Annotated[RenderAV2TargetCamera, tyro.conf.subcommand(name="av2-target-camera")],
+        Annotated[FitAV2StereoAppearance, tyro.conf.subcommand(name="fit-av2-stereo-appearance")],
     ]
 ]
 

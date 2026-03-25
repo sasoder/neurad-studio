@@ -1510,6 +1510,32 @@ class SplatADModel(ADModel):
 
     def _get_appearance_embedding(self, sensor: Union[Cameras, Lidars], features: torch.Tensor) -> torch.Tensor:
         metadata = sensor.metadata if sensor.metadata is not None else {}
+        appearance_override = metadata.get("appearance_embedding", None)
+        if appearance_override is not None:
+            appearance_override = appearance_override.to(features.device)
+            if appearance_override.shape[-1] != self.config.appearance_dim:
+                raise ValueError(
+                    "Appearance override has wrong dimensionality: "
+                    f"expected {self.config.appearance_dim}, got {appearance_override.shape[-1]}"
+                )
+            if appearance_override.ndim == 1:
+                appearance_override = appearance_override.view(*([1] * (features.ndim - 1)), -1)
+            elif appearance_override.ndim == 2:
+                if appearance_override.shape[0] != features.shape[0]:
+                    raise ValueError(
+                        "Appearance override batch dimension must match the rendered feature batch dimension: "
+                        f"expected {features.shape[0]}, got {appearance_override.shape[0]}"
+                    )
+                appearance_override = appearance_override.view(
+                    appearance_override.shape[0], *([1] * (features.ndim - 2)), appearance_override.shape[-1]
+                )
+            elif appearance_override.ndim != features.ndim:
+                raise ValueError(
+                    "Appearance override must be 1D, 2D, or already broadcastable to rendered features. "
+                    f"Got shape {tuple(appearance_override.shape)} for features with shape {tuple(features.shape)}."
+                )
+            return appearance_override.expand(*features.shape[:-1], -1)
+
         sensor_idx = metadata.get("sensor_idxs", None)
         if sensor_idx is None:
             assert not self.training, "Sensor sensor_idx must be present in metadata during training"
