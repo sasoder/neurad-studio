@@ -470,8 +470,8 @@ def _infer_scene_id_from_load_config(load_config: Path) -> str:
 
 def _get_default_stereo_sidecar_path(load_config: Path) -> Path:
     if (load_config.parent / "nerfstudio_models").exists():
-        return load_config.parent / "nerfstudio_models" / "stereo_appearance.pt"
-    return load_config.parent.parent / "nerfstudio_models" / "stereo_appearance.pt"
+        return load_config.parent / "nerfstudio_models" / "sidecars" / "stereo_appearance.pt"
+    return load_config.parent.parent / "nerfstudio_models" / "sidecars" / "stereo_appearance.pt"
 
 
 def _get_default_av2_appearance_sensor(target_camera: str) -> str:
@@ -1810,7 +1810,7 @@ class FitAV2StereoAppearance:
     """Path to the base config YAML file."""
 
     output_path: Optional[Path] = None
-    """Optional sidecar output path. Defaults to <run-dir>/stereo_appearance.pt."""
+    """Optional sidecar output path. Defaults to <run-dir>/sidecars/stereo_appearance.pt."""
 
     sequence: str = ""
     """AV2 sequence UUID to fit. Defaults to the scene id inferred from load_config."""

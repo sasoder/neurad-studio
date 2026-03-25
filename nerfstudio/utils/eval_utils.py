@@ -55,7 +55,16 @@ def eval_load_checkpoint(
                 justify="center",
             )
             sys.exit(1)
-        load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(config.load_dir))[-1]
+        checkpoint_files = []
+        for path in Path(config.load_dir).iterdir():
+            if path.is_file() and path.name.startswith("step-") and path.suffix == ".ckpt":
+                checkpoint_files.append(path)
+        if not checkpoint_files:
+            CONSOLE.rule("Error", style="red")
+            CONSOLE.print(f"No checkpoint files found at {config.load_dir}", justify="center")
+            CONSOLE.print("Expected files named like step-000030000.ckpt", justify="center")
+            sys.exit(1)
+        load_step = max(int(path.stem.split("-", 1)[1]) for path in checkpoint_files)
     else:
         load_step = config.load_step
     load_path = config.load_dir / f"step-{load_step:09d}.ckpt"
