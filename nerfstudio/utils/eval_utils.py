@@ -104,7 +104,8 @@ def eval_setup(
 
     # load checkpoints from wherever they were saved
     # TODO: expose the ability to choose an arbitrary checkpoint
-    config.load_dir = config.load_dir or config.get_checkpoint_dir()
+    if config.load_dir is None:
+        config.load_dir = config_path.parent / config.relative_model_dir
 
     # setup pipeline (which includes the DataManager)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
