@@ -30,7 +30,7 @@ import sys
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import mediapy as media
 import numpy as np
@@ -99,6 +99,7 @@ def _render_trajectory_video(
     colormap_options: colormaps.ColormapOptions = colormaps.ColormapOptions(),
     render_nearest_camera=False,
     check_occlusions: bool = False,
+    rgb_postprocess_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> None:
     """Helper function to create a video of the spiral trajectory.
 
@@ -244,6 +245,8 @@ def _render_trajectory_video(
                             .numpy()
                         )
                     else:
+                        if rendered_output_name == "rgb" and rgb_postprocess_fn is not None:
+                            output_image = rgb_postprocess_fn(output_image)
                         output_image = (
                             colormaps.apply_colormap(
                                 image=output_image,
@@ -474,6 +477,12 @@ def _get_default_stereo_sidecar_path(load_config: Path) -> Path:
     return load_config.parent.parent / "nerfstudio_models" / "sidecars" / "stereo_appearance.pt"
 
 
+def _get_default_stereo_photometric_sidecar_path(load_config: Path) -> Path:
+    if (load_config.parent / "nerfstudio_models").exists():
+        return load_config.parent / "nerfstudio_models" / "sidecars" / "stereo_photometric.pt"
+    return load_config.parent.parent / "nerfstudio_models" / "sidecars" / "stereo_photometric.pt"
+
+
 def _get_default_av2_appearance_sensor(target_camera: str) -> str:
     return DEFAULT_AV2_STEREO_APPEARANCE_SENSORS.get(target_camera, "ring_front_right")
 
@@ -524,6 +533,60 @@ def _save_stereo_appearance_sidecar(
         },
         sidecar_path,
     )
+
+
+def _load_stereo_photometric_sidecar(sidecar_path: Path) -> Dict[str, Any]:
+    sidecar = torch.load(sidecar_path, map_location="cpu")
+    if not isinstance(sidecar, dict) or "entries" not in sidecar:
+        raise ValueError(f"Invalid stereo photometric sidecar: {sidecar_path}")
+    return sidecar
+
+
+def _save_stereo_photometric_sidecar(
+    sidecar_path: Path,
+    *,
+    load_config: Path,
+    sequence: str,
+    entries: Dict[str, Dict[str, Any]],
+    fit_settings: Dict[str, Any],
+) -> None:
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "format": "splatad_stereo_photometric_v1",
+            "load_config": str(load_config),
+            "sequence": sequence,
+            "entries": entries,
+            "fit_settings": fit_settings,
+        },
+        sidecar_path,
+    )
+
+
+def _rgb_to_luminance(rgb: torch.Tensor) -> torch.Tensor:
+    weights = torch.tensor([0.299, 0.587, 0.114], dtype=rgb.dtype, device=rgb.device)
+    return (rgb * weights).sum(dim=-1, keepdim=True)
+
+
+def _extract_grayscale_target(image: torch.Tensor) -> torch.Tensor:
+    if image.shape[-1] == 1:
+        return image
+    return image[..., :1]
+
+
+def _apply_affine_grayscale_mapping(rgb: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    gray = torch.clamp(_rgb_to_luminance(rgb) * scale + bias, 0.0, 1.0)
+    return gray.expand(*rgb.shape[:-1], 3)
+
+
+def _build_photometric_postprocess(entry: Dict[str, Any]) -> Callable[[torch.Tensor], torch.Tensor]:
+    scale = torch.as_tensor(entry["scale"], dtype=torch.float32)
+    bias = torch.as_tensor(entry["bias"], dtype=torch.float32)
+
+    def _postprocess(rgb: torch.Tensor) -> torch.Tensor:
+        return _apply_affine_grayscale_mapping(rgb, scale.to(rgb.device), bias.to(rgb.device))
+
+    return _postprocess
 
 
 def _resolve_av2_split_root(
@@ -829,6 +892,8 @@ def _write_av2_render_manifest(
     reference_delta: Optional[Dict[str, Any]] = None,
     appearance_sidecar: Optional[Path] = None,
     used_fitted_appearance: bool = False,
+    photometric_sidecar: Optional[Path] = None,
+    used_photometric_mapping: bool = False,
 ) -> None:
     manifest = {
         "load_config": str(load_config),
@@ -844,9 +909,12 @@ def _write_av2_render_manifest(
         "relative_times_seconds": [float(value) for value in relative_times[:, 0].tolist()],
         "sensor_idx_to_name": {str(idx): name for idx, name in sensor_idx_to_name.items()},
         "used_fitted_appearance": used_fitted_appearance,
+        "used_photometric_mapping": used_photometric_mapping,
     }
     if appearance_sidecar is not None:
         manifest["appearance_sidecar"] = str(appearance_sidecar)
+    if photometric_sidecar is not None:
+        manifest["photometric_sidecar"] = str(photometric_sidecar)
     if reference_delta is not None:
         manifest["reference_to_target_delta"] = reference_delta
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -1641,6 +1709,9 @@ class RenderAV2TargetCamera(BaseRender):
     appearance_sidecar: Optional[Path] = None
     """Optional sidecar file containing fitted stereo appearance embeddings."""
 
+    photometric_sidecar: Optional[Path] = None
+    """Optional sidecar file containing fitted stereo photometric grayscale mappings."""
+
     reference_camera: Optional[str] = None
     """Optional camera used when exporting rigid camera-to-camera deltas. Defaults to appearance_sensor."""
 
@@ -1678,6 +1749,15 @@ class RenderAV2TargetCamera(BaseRender):
         dataparser_outputs = pipeline.datamanager.train_dataparser_outputs
         sensor_idx_to_name = dataparser_outputs.metadata["sensor_idx_to_name"]
         sensor_name_to_idx = {name: idx for idx, name in sensor_idx_to_name.items()}
+        default_appearance_sensor = _get_default_av2_appearance_sensor(self.target_camera)
+        photometric_sidecar = None
+        photometric_entry = None
+        if self.photometric_sidecar is not None:
+            photometric_sidecar = _load_stereo_photometric_sidecar(self.photometric_sidecar)
+            photometric_entry = photometric_sidecar.get("entries", {}).get(self.target_camera)
+            donor_sensor = photometric_entry.get("appearance_sensor") if photometric_entry is not None else None
+            if donor_sensor is not None and self.appearance_sensor in {"ring_front_right", default_appearance_sensor}:
+                self.appearance_sensor = donor_sensor
         if self.appearance_sensor == "ring_front_right" and self.target_camera in DEFAULT_AV2_STEREO_APPEARANCE_SENSORS:
             self.appearance_sensor = _get_default_av2_appearance_sensor(self.target_camera)
         if self.appearance_sensor not in sensor_name_to_idx:
@@ -1694,12 +1774,23 @@ class RenderAV2TargetCamera(BaseRender):
         appearance_sensor_idx = int(sensor_name_to_idx[self.appearance_sensor])
         appearance_override = None
         used_fitted_appearance = False
+        rgb_postprocess_fn = None
+        used_photometric_mapping = False
         if self.appearance_sidecar is not None:
             sidecar = _load_stereo_appearance_sidecar(self.appearance_sidecar)
             appearance_override = _get_sidecar_appearance_embedding(
                 sidecar, self.target_camera, pipeline.model.config.appearance_dim
             )
             used_fitted_appearance = appearance_override is not None
+        if photometric_entry is not None:
+            donor_sensor = photometric_entry.get("appearance_sensor")
+            if donor_sensor is not None and donor_sensor != self.appearance_sensor:
+                CONSOLE.print(
+                    f"[yellow]Photometric sidecar for {self.target_camera} was fit using {donor_sensor}, "
+                    f"but render is using {self.appearance_sensor} appearance.[/yellow]"
+                )
+            rgb_postprocess_fn = _build_photometric_postprocess(photometric_entry)
+            used_photometric_mapping = True
         dataparser_config = pipeline.datamanager.dataparser.config
         cameras, timestamps_ns, calibration_info = _build_av2_target_cameras(
             split_root=split_root,
@@ -1738,6 +1829,8 @@ class RenderAV2TargetCamera(BaseRender):
         )
         if used_fitted_appearance:
             CONSOLE.print(f"Using fitted appearance override from {self.appearance_sidecar}")
+        if used_photometric_mapping:
+            CONSOLE.print(f"Using fitted photometric mapping from {self.photometric_sidecar}")
         CONSOLE.print(f"First timestamp: {timestamps_ns[0]}, last timestamp: {timestamps_ns[-1]}, split: {data_split}")
         if calibration_info.get("used_fallback", False):
             CONSOLE.print(
@@ -1774,6 +1867,7 @@ class RenderAV2TargetCamera(BaseRender):
             colormap_options=self.colormap_options,
             render_nearest_camera=self.render_nearest_camera,
             check_occlusions=self.check_occlusions,
+            rgb_postprocess_fn=rgb_postprocess_fn,
         )
 
         if self.output_format == "images":
@@ -1798,6 +1892,8 @@ class RenderAV2TargetCamera(BaseRender):
             reference_delta=reference_delta,
             appearance_sidecar=self.appearance_sidecar,
             used_fitted_appearance=used_fitted_appearance,
+            photometric_sidecar=self.photometric_sidecar,
+            used_photometric_mapping=used_photometric_mapping,
         )
         CONSOLE.print(f"[bold][green]:glowing_star: Render manifest saved to {manifest_path}")
 
@@ -2010,6 +2106,171 @@ class FitAV2StereoAppearance:
             CONSOLE.print(f"Fitted mean L1 for {target_camera}: {value:.6f} (baseline {baseline_l1[target_camera]:.6f})")
 
 
+@dataclass
+class FitAV2StereoPhotometric:
+    """Fit a grayscale photometric mapping for AV2 stereo cameras on top of frozen renders."""
+
+    load_config: Path
+    """Path to the base config YAML file."""
+
+    output_path: Optional[Path] = None
+    """Optional sidecar output path. Defaults to <run-dir>/sidecars/stereo_photometric.pt."""
+
+    sequence: str = ""
+    """AV2 sequence UUID to fit. Defaults to the scene id inferred from load_config."""
+
+    target_cameras: Tuple[str, ...] = ("stereo_front_left", "stereo_front_right")
+    """AV2 camera streams to fit grayscale mappings for."""
+
+    appearance_sensor: str = "ring_front_center"
+    """Training camera appearance used to produce the source stereo-view renders."""
+
+    data_root: Path = Path("data/av2")
+    """Root directory containing the AV2 dataset."""
+
+    split: Optional[Literal["train", "val", "test", "mini", "mini_val", "mini_test"]] = None
+    """Dataset split override. If omitted, infer the split by searching the dataset."""
+
+    start_frame: int = 0
+    """First frame index to use for fitting."""
+
+    max_frames: Optional[int] = None
+    """Maximum number of frames to use per stereo camera."""
+
+    downscale_factor: float = 1.0
+    """Downscale factor applied during fitting."""
+
+    eval_num_rays_per_chunk: Optional[int] = None
+    """Optional eval chunk size override."""
+
+    def main(self) -> None:
+        scene_id = _infer_scene_id_from_load_config(self.load_config)
+        sequence = self.sequence or scene_id
+        output_path = self.output_path or _get_default_stereo_photometric_sidecar_path(self.load_config)
+
+        _, pipeline, _, _ = eval_setup(
+            self.load_config,
+            eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+            test_mode="inference",
+            update_config_callback=streamline_ad_config,
+            strict_load=False,
+        )
+
+        model = pipeline.model
+        model.eval()
+        dataparser_outputs = pipeline.datamanager.train_dataparser_outputs
+        sensor_idx_to_name = dataparser_outputs.metadata["sensor_idx_to_name"]
+        sensor_name_to_idx = {name: idx for idx, name in sensor_idx_to_name.items()}
+        if self.appearance_sensor not in sensor_name_to_idx:
+            available = ", ".join(sensor_name_to_idx)
+            raise ValueError(f"appearance_sensor {self.appearance_sensor!r} not found. Available sensors: {available}")
+
+        split_root, data_split = _resolve_av2_split_root(self.data_root, sequence, self.split)
+        dataloader = AV2SensorDataLoader(split_root, split_root)
+        world_transform = pose_utils.to4x4(dataparser_outputs.dataparser_transform).cpu().float()
+        time_offset = float(dataparser_outputs.time_offset)
+        dataparser_config = pipeline.datamanager.dataparser.config
+        donor_sensor_idx = int(sensor_name_to_idx[self.appearance_sensor])
+
+        entries: Dict[str, Dict[str, Any]] = {}
+        CONSOLE.print(f"Fitting stereo photometric mapping for {sequence} on split {data_split}")
+        for target_camera in self.target_cameras:
+            image_paths = dataloader.get_ordered_log_cam_fpaths(sequence, target_camera)
+            selected_image_paths = _slice_frame_paths(image_paths, self.start_frame, self.max_frames)
+            cameras, _, _ = _build_av2_target_cameras(
+                split_root=split_root,
+                dataloader=dataloader,
+                sequence=sequence,
+                target_camera=target_camera,
+                image_paths=selected_image_paths,
+                world_transform=world_transform,
+                time_offset=time_offset,
+                appearance_sensor_idx=donor_sensor_idx,
+                rolling_shutter_time=float(dataparser_config.rolling_shutter_time),
+                time_to_center_pixel=float(dataparser_config.time_to_center_pixel),
+                fallback_reference_camera=self.appearance_sensor,
+            )
+            if self.downscale_factor != 1.0:
+                cameras.rescale_output_resolution(1.0 / self.downscale_factor)
+
+            xtx = torch.zeros((2, 2), dtype=torch.float64)
+            xty = torch.zeros((2,), dtype=torch.float64)
+            baseline_abs_error = 0.0
+            pixel_count = 0
+
+            with torch.no_grad():
+                for idx, image_path in enumerate(selected_image_paths):
+                    gt_image = _load_av2_rgb_image(image_path, int(cameras.height[idx].item()), int(cameras.width[idx].item()))
+                    gt_gray = _extract_grayscale_target(gt_image)
+                    outputs = model.get_outputs(cameras[idx : idx + 1].to(model.device))
+                    pred_rgb = outputs["rgb"].detach().cpu()
+                    pred_gray = _rgb_to_luminance(pred_rgb)
+
+                    x = pred_gray.reshape(-1).double()
+                    y = gt_gray.reshape(-1).double()
+                    ones = torch.ones_like(x)
+                    design = torch.stack((x, ones), dim=-1)
+                    xtx += design.T @ design
+                    xty += design.T @ y
+
+                    baseline_abs_error += torch.abs(pred_gray - gt_gray).sum().item()
+                    pixel_count += gt_gray.numel()
+
+            ridge = torch.tensor([[1e-6, 0.0], [0.0, 1e-6]], dtype=torch.float64)
+            solution = torch.linalg.solve(xtx + ridge, xty)
+            scale = float(solution[0].item())
+            bias = float(solution[1].item())
+
+            fitted_abs_error = 0.0
+            with torch.no_grad():
+                for idx, image_path in enumerate(selected_image_paths):
+                    gt_image = _load_av2_rgb_image(image_path, int(cameras.height[idx].item()), int(cameras.width[idx].item()))
+                    gt_gray = _extract_grayscale_target(gt_image)
+                    outputs = model.get_outputs(cameras[idx : idx + 1].to(model.device))
+                    pred_rgb = outputs["rgb"].detach().cpu()
+                    mapped_gray = _extract_grayscale_target(
+                        _apply_affine_grayscale_mapping(
+                            pred_rgb,
+                            torch.tensor(scale, dtype=pred_rgb.dtype),
+                            torch.tensor(bias, dtype=pred_rgb.dtype),
+                        )
+                    )
+                    fitted_abs_error += torch.abs(mapped_gray - gt_gray).sum().item()
+
+            baseline_mean_l1 = baseline_abs_error / pixel_count
+            fitted_mean_l1 = fitted_abs_error / pixel_count
+            entries[target_camera] = {
+                "appearance_sensor": self.appearance_sensor,
+                "scale": scale,
+                "bias": bias,
+                "baseline_mean_l1": baseline_mean_l1,
+                "fitted_mean_l1": fitted_mean_l1,
+                "num_frames": len(selected_image_paths),
+                "downscale_factor": self.downscale_factor,
+            }
+            CONSOLE.print(
+                f"{target_camera}: scale={scale:.6f}, bias={bias:.6f}, "
+                f"mean L1 {baseline_mean_l1:.6f} -> {fitted_mean_l1:.6f}"
+            )
+
+        _save_stereo_photometric_sidecar(
+            output_path,
+            load_config=self.load_config,
+            sequence=sequence,
+            entries=entries,
+            fit_settings={
+                "data_root": str(self.data_root),
+                "data_split": data_split,
+                "target_cameras": list(self.target_cameras),
+                "appearance_sensor": self.appearance_sensor,
+                "start_frame": self.start_frame,
+                "max_frames": self.max_frames,
+                "downscale_factor": self.downscale_factor,
+            },
+        )
+        CONSOLE.print(f"[bold][green]:glowing_star: Stereo photometric sidecar saved to {output_path}")
+
+
 def plot_lidar_points(points, output_path, cmin=-6.0, cmax=5.0, width=1920, height=1080, ranges=[100, 200, 10]):
     x = points[:, 0]
     y = points[:, 1]
@@ -2096,6 +2357,7 @@ Commands = tyro.conf.FlagConversionOff[
         Annotated[DatasetRender, tyro.conf.subcommand(name="dataset")],
         Annotated[RenderAV2TargetCamera, tyro.conf.subcommand(name="av2-target-camera")],
         Annotated[FitAV2StereoAppearance, tyro.conf.subcommand(name="fit-av2-stereo-appearance")],
+        Annotated[FitAV2StereoPhotometric, tyro.conf.subcommand(name="fit-av2-stereo-photometric")],
     ]
 ]
 
