@@ -99,7 +99,7 @@ def _render_trajectory_video(
     colormap_options: colormaps.ColormapOptions = colormaps.ColormapOptions(),
     render_nearest_camera=False,
     check_occlusions: bool = False,
-    rgb_postprocess_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    rgb_postprocess_fn: Optional[Callable[[torch.Tensor, int], torch.Tensor]] = None,
 ) -> None:
     """Helper function to create a video of the spiral trajectory.
 
@@ -246,7 +246,7 @@ def _render_trajectory_video(
                         )
                     else:
                         if rendered_output_name == "rgb" and rgb_postprocess_fn is not None:
-                            output_image = rgb_postprocess_fn(output_image)
+                            output_image = rgb_postprocess_fn(output_image, camera_idx)
                         output_image = (
                             colormaps.apply_colormap(
                                 image=output_image,
@@ -575,25 +575,33 @@ def _extract_grayscale_target(image: torch.Tensor) -> torch.Tensor:
 
 
 def _apply_tone_mapped_grayscale_mapping(
-    rgb: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor, gamma: torch.Tensor
+    rgb: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor, gamma: torch.Tensor, gain: torch.Tensor
 ) -> torch.Tensor:
     luminance = _rgb_to_luminance(rgb)
     gamma = torch.clamp(gamma, min=1e-3)
-    gray = torch.clamp(scale * torch.pow(torch.clamp(luminance, 0.0, 1.0), gamma) + bias, 0.0, 1.0)
+    gray = torch.clamp(gain * (scale * torch.pow(torch.clamp(luminance, 0.0, 1.0), gamma) + bias), 0.0, 1.0)
     return gray.expand(*rgb.shape[:-1], 3)
 
 
-def _build_photometric_postprocess(entry: Dict[str, Any]) -> Callable[[torch.Tensor], torch.Tensor]:
+def _build_photometric_postprocess(
+    entry: Dict[str, Any], timestamps_ns: Optional[List[int]] = None
+) -> Callable[[torch.Tensor, int], torch.Tensor]:
     scale = torch.as_tensor(entry["scale"], dtype=torch.float32)
     bias = torch.as_tensor(entry["bias"], dtype=torch.float32)
     gamma = torch.as_tensor(entry.get("gamma", 1.0), dtype=torch.float32)
+    frame_gains = entry.get("frame_gains", {})
+    default_gain = torch.as_tensor(entry.get("default_gain", 1.0), dtype=torch.float32)
 
-    def _postprocess(rgb: torch.Tensor) -> torch.Tensor:
+    def _postprocess(rgb: torch.Tensor, camera_idx: int) -> torch.Tensor:
+        gain = default_gain
+        if timestamps_ns is not None and camera_idx < len(timestamps_ns):
+            gain = torch.as_tensor(frame_gains.get(str(int(timestamps_ns[camera_idx])), default_gain), dtype=torch.float32)
         return _apply_tone_mapped_grayscale_mapping(
             rgb,
             scale.to(rgb.device),
             bias.to(rgb.device),
             gamma.to(rgb.device),
+            gain.to(rgb.device),
         )
 
     return _postprocess
@@ -1778,6 +1786,7 @@ class RenderAV2TargetCamera(BaseRender):
         dataloader = AV2SensorDataLoader(split_root, split_root)
         image_paths = dataloader.get_ordered_log_cam_fpaths(sequence, self.target_camera)
         selected_image_paths = _slice_frame_paths(image_paths, self.start_frame, self.max_frames)
+        selected_timestamps_ns = [int(path.stem) for path in selected_image_paths]
 
         world_transform = pose_utils.to4x4(dataparser_outputs.dataparser_transform).cpu().float()
         time_offset = float(dataparser_outputs.time_offset)
@@ -1799,7 +1808,7 @@ class RenderAV2TargetCamera(BaseRender):
                     f"[yellow]Photometric sidecar for {self.target_camera} was fit using {donor_sensor}, "
                     f"but render is using {self.appearance_sensor} appearance.[/yellow]"
                 )
-            rgb_postprocess_fn = _build_photometric_postprocess(photometric_entry)
+            rgb_postprocess_fn = _build_photometric_postprocess(photometric_entry, timestamps_ns=selected_timestamps_ns)
             used_photometric_mapping = True
         dataparser_config = pipeline.datamanager.dataparser.config
         cameras, timestamps_ns, calibration_info = _build_av2_target_cameras(
@@ -2159,6 +2168,9 @@ class FitAV2StereoPhotometric:
     sample_pixels_per_frame: int = 50000
     """Maximum number of pixels to sample per frame when fitting the tone curve."""
 
+    gain_reg_lambda: float = 1e-2
+    """Regularization weight keeping per-frame gains near 1.0."""
+
     eval_num_rays_per_chunk: Optional[int] = None
     """Optional eval chunk size override."""
 
@@ -2216,6 +2228,7 @@ class FitAV2StereoPhotometric:
             gt_grays = []
             baseline_abs_error = 0.0
             pixel_count = 0
+            timestamps_ns = [int(path.stem) for path in selected_image_paths]
 
             with torch.no_grad():
                 for idx, image_path in enumerate(selected_image_paths):
@@ -2237,17 +2250,25 @@ class FitAV2StereoPhotometric:
                     baseline_abs_error += torch.abs(pred_gray - gt_gray).sum().item()
                     pixel_count += gt_gray.numel()
 
-            pred_gray_all = torch.cat(pred_grays, dim=0)
-            gt_gray_all = torch.cat(gt_grays, dim=0)
             scale_param = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
             bias_param = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
             log_gamma_param = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-            optimizer = torch.optim.Adam((scale_param, bias_param, log_gamma_param), lr=self.learning_rate)
+            log_gain_params = torch.nn.Parameter(torch.zeros(len(pred_grays), dtype=torch.float32))
+            optimizer = torch.optim.Adam((scale_param, bias_param, log_gamma_param, log_gain_params), lr=self.learning_rate)
 
             for _ in range(self.max_steps):
                 gamma = torch.exp(log_gamma_param)
-                mapped = torch.clamp(scale_param * torch.pow(torch.clamp(pred_gray_all, 0.0, 1.0), gamma) + bias_param, 0.0, 1.0)
-                loss = torch.abs(mapped - gt_gray_all).mean()
+                frame_losses = []
+                for frame_idx, (pred_gray_frame, gt_gray_frame) in enumerate(zip(pred_grays, gt_grays)):
+                    gain = torch.exp(log_gain_params[frame_idx])
+                    mapped = torch.clamp(
+                        gain * (scale_param * torch.pow(torch.clamp(pred_gray_frame, 0.0, 1.0), gamma) + bias_param),
+                        0.0,
+                        1.0,
+                    )
+                    frame_losses.append(torch.abs(mapped - gt_gray_frame).mean())
+                loss = torch.stack(frame_losses).mean()
+                loss = loss + self.gain_reg_lambda * torch.square(log_gain_params).mean()
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
@@ -2255,19 +2276,40 @@ class FitAV2StereoPhotometric:
             scale = float(scale_param.detach().item())
             bias = float(bias_param.detach().item())
             gamma = float(torch.exp(log_gamma_param.detach()).item())
-            fitted_gray = torch.clamp(
-                scale * torch.pow(torch.clamp(pred_gray_all, 0.0, 1.0), gamma) + bias,
-                0.0,
-                1.0,
-            )
+            frame_gains = torch.exp(log_gain_params.detach()).cpu()
+
+            fitted_abs_error = 0.0
+            with torch.no_grad():
+                for frame_idx, image_path in enumerate(selected_image_paths):
+                    gt_image = _load_av2_rgb_image(
+                        image_path, int(cameras.height[frame_idx].item()), int(cameras.width[frame_idx].item())
+                    )
+                    gt_gray = _extract_grayscale_target(gt_image)
+                    outputs = model.get_outputs(cameras[frame_idx : frame_idx + 1].to(model.device))
+                    pred_rgb = outputs["rgb"].detach().cpu()
+                    mapped_gray = _extract_grayscale_target(
+                        _apply_tone_mapped_grayscale_mapping(
+                            pred_rgb,
+                            torch.tensor(scale, dtype=pred_rgb.dtype),
+                            torch.tensor(bias, dtype=pred_rgb.dtype),
+                            torch.tensor(gamma, dtype=pred_rgb.dtype),
+                            frame_gains[frame_idx].to(dtype=pred_rgb.dtype),
+                        )
+                    )
+                    fitted_abs_error += torch.abs(mapped_gray - gt_gray).sum().item()
 
             baseline_mean_l1 = baseline_abs_error / pixel_count
-            fitted_mean_l1 = torch.abs(fitted_gray - gt_gray_all).mean().item()
+            fitted_mean_l1 = fitted_abs_error / pixel_count
             entries[target_camera] = {
                 "appearance_sensor": self.appearance_sensor,
                 "scale": scale,
                 "bias": bias,
                 "gamma": gamma,
+                "default_gain": 1.0,
+                "frame_gains": {
+                    str(timestamp_ns): float(frame_gains[frame_idx].item())
+                    for frame_idx, timestamp_ns in enumerate(timestamps_ns)
+                },
                 "baseline_mean_l1": baseline_mean_l1,
                 "fitted_mean_l1": fitted_mean_l1,
                 "num_frames": len(selected_image_paths),
@@ -2275,6 +2317,7 @@ class FitAV2StereoPhotometric:
                 "max_steps": self.max_steps,
                 "learning_rate": self.learning_rate,
                 "sample_pixels_per_frame": self.sample_pixels_per_frame,
+                "gain_reg_lambda": self.gain_reg_lambda,
             }
             CONSOLE.print(
                 f"{target_camera}: scale={scale:.6f}, bias={bias:.6f}, gamma={gamma:.6f}, "
@@ -2297,6 +2340,7 @@ class FitAV2StereoPhotometric:
                 "max_steps": self.max_steps,
                 "learning_rate": self.learning_rate,
                 "sample_pixels_per_frame": self.sample_pixels_per_frame,
+                "gain_reg_lambda": self.gain_reg_lambda,
             },
         )
         CONSOLE.print(f"[bold][green]:glowing_star: Stereo photometric sidecar saved to {output_path}")
