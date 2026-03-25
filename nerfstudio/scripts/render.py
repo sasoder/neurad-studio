@@ -34,11 +34,12 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import mediapy as media
 import numpy as np
+import pandas as pd
 import plotly.graph_objs as go
 import torch
 import tyro
 import viser.transforms as tf
-from av2.datasets.sensor.av2_sensor_dataloader import AV2SensorDataLoader
+from av2.datasets.sensor.av2_sensor_dataloader import AV2SensorDataLoader, convert_pose_dataframe_to_SE3
 from jaxtyping import Float
 from PIL import Image
 from rich import box, style
@@ -54,7 +55,7 @@ from nerfstudio.cameras.camera_paths import (
     get_path_from_json,
     get_spiral_path,
 )
-from nerfstudio.cameras.camera_utils import rotmat_to_unitquat
+from nerfstudio.cameras.camera_utils import rotmat_to_unitquat, unitquat_to_rotmat
 from nerfstudio.cameras.cameras import Cameras, CameraType, RayBundle
 from nerfstudio.cameras.lidars import transform_points
 from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager, VanillaDataManagerConfig
@@ -79,6 +80,7 @@ DEFAULT_AV2_STEREO_APPEARANCE_SENSORS = {
     "stereo_front_left": "ring_front_left",
     "stereo_front_right": "ring_front_right",
 }
+AV2_CAMERA_DELTA_CACHE: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 
 
 def _render_trajectory_video(
@@ -453,9 +455,13 @@ class BaseRender:
 
 
 def _infer_scene_id_from_load_config(load_config: Path) -> str:
-    """Infer the AV2 scene id from outputs/.../splatad/{scene_id}/{timestamp}/config.yml."""
+    """Infer the AV2 scene id from either .../{scene_id}/config.yml or .../{scene_id}/{timestamp}/config.yml."""
     if load_config.name != "config.yml":
         raise ValueError(f"Expected load_config to point to config.yml, got {load_config}")
+    if (load_config.parent / "nerfstudio_models").exists():
+        return load_config.parent.name
+    if (load_config.parent.parent / "nerfstudio_models").exists():
+        return load_config.parent.parent.name
     scene_id = load_config.parent.parent.name
     if not scene_id:
         raise ValueError(f"Could not infer scene id from {load_config}")
@@ -463,7 +469,9 @@ def _infer_scene_id_from_load_config(load_config: Path) -> str:
 
 
 def _get_default_stereo_sidecar_path(load_config: Path) -> Path:
-    return load_config.parent / "nerfstudio_models" / "stereo_appearance.pt"
+    if (load_config.parent / "nerfstudio_models").exists():
+        return load_config.parent / "nerfstudio_models" / "stereo_appearance.pt"
+    return load_config.parent.parent / "nerfstudio_models" / "stereo_appearance.pt"
 
 
 def _get_default_av2_appearance_sensor(target_camera: str) -> str:
@@ -550,7 +558,96 @@ def _infer_video_seconds_from_times(times: torch.Tensor) -> float:
     return times.shape[0] / fps
 
 
+def _read_av2_intrinsics(scene_dir: Path, camera_name: str) -> Tuple[np.ndarray, int, int]:
+    intrinsics_df = pd.read_feather(scene_dir / "calibration" / "intrinsics.feather")
+    rows = intrinsics_df[intrinsics_df["sensor_name"] == camera_name]
+    if len(rows) != 1:
+        raise KeyError(camera_name)
+    params = rows.iloc[0]
+    intrinsics = np.eye(3, dtype=np.float32)
+    intrinsics[0, 0] = float(params["fx_px"])
+    intrinsics[1, 1] = float(params["fy_px"])
+    intrinsics[0, 2] = float(params["cx_px"])
+    intrinsics[1, 2] = float(params["cy_px"])
+    return intrinsics, int(params["width_px"]), int(params["height_px"])
+
+
+def _read_av2_sensor_extrinsic(scene_dir: Path, camera_name: str) -> np.ndarray:
+    extrinsics_df = pd.read_feather(scene_dir / "calibration" / "egovehicle_SE3_sensor.feather")
+    rows = extrinsics_df[extrinsics_df["sensor_name"] == camera_name]
+    if len(rows) != 1:
+        raise KeyError(camera_name)
+    return convert_pose_dataframe_to_SE3(rows).transform_matrix.astype(np.float32)
+
+
+def _compute_average_av2_camera_delta(split_root: Path, reference_camera: str, target_camera: str) -> Dict[str, Any]:
+    cache_key = (str(split_root), reference_camera, target_camera)
+    if cache_key in AV2_CAMERA_DELTA_CACHE:
+        return AV2_CAMERA_DELTA_CACHE[cache_key]
+
+    deltas = []
+    scene_ids = []
+    for scene_dir in sorted(path for path in split_root.iterdir() if path.is_dir()):
+        calibration_dir = scene_dir / "calibration"
+        if not calibration_dir.exists():
+            continue
+        try:
+            reference_extrinsic = _read_av2_sensor_extrinsic(scene_dir, reference_camera)
+            target_extrinsic = _read_av2_sensor_extrinsic(scene_dir, target_camera)
+        except KeyError:
+            continue
+        deltas.append(torch.tensor(np.linalg.inv(reference_extrinsic) @ target_extrinsic, dtype=torch.float32))
+        scene_ids.append(scene_dir.name)
+
+    if not deltas:
+        raise ValueError(f"Could not compute fallback delta for {reference_camera} -> {target_camera}")
+
+    deltas_tensor = torch.stack(deltas, dim=0)
+    translations = deltas_tensor[:, :3, 3]
+    quaternions = rotmat_to_unitquat(deltas_tensor[:, :3, :3])
+    reference_quaternion = quaternions[0:1]
+    signs = torch.where((quaternions * reference_quaternion).sum(dim=-1, keepdim=True) < 0, -1.0, 1.0)
+    mean_quaternion = torch.nn.functional.normalize((quaternions * signs).mean(dim=0, keepdim=True), dim=-1)[0]
+    mean_rotation = unitquat_to_rotmat(mean_quaternion.unsqueeze(0))[0].float()
+
+    mean_delta = torch.eye(4, dtype=torch.float32)
+    mean_delta[:3, :3] = mean_rotation
+    mean_delta[:3, 3] = translations.mean(dim=0)
+    result = {
+        "transform_matrix": mean_delta,
+        "num_scenes_used": len(scene_ids),
+        "scene_ids_used": scene_ids,
+    }
+    AV2_CAMERA_DELTA_CACHE[cache_key] = result
+    return result
+
+
+def _get_av2_camera_calibration(
+    split_root: Path,
+    sequence: str,
+    camera_name: str,
+    fallback_reference_camera: Optional[str] = None,
+) -> Tuple[np.ndarray, int, int, np.ndarray, Dict[str, Any]]:
+    scene_dir = split_root / sequence
+    intrinsics, width_px, height_px = _read_av2_intrinsics(scene_dir, camera_name)
+    try:
+        extrinsic = _read_av2_sensor_extrinsic(scene_dir, camera_name)
+        return intrinsics, width_px, height_px, extrinsic, {"used_fallback": False}
+    except KeyError:
+        if fallback_reference_camera is None:
+            raise
+        reference_extrinsic = _read_av2_sensor_extrinsic(scene_dir, fallback_reference_camera)
+        fallback_delta = _compute_average_av2_camera_delta(split_root, fallback_reference_camera, camera_name)
+        extrinsic = (reference_extrinsic @ fallback_delta["transform_matrix"].cpu().numpy()).astype(np.float32)
+        return intrinsics, width_px, height_px, extrinsic, {
+            "used_fallback": True,
+            "reference_camera": fallback_reference_camera,
+            "num_scenes_used": fallback_delta["num_scenes_used"],
+        }
+
+
 def _build_av2_target_cameras(
+    split_root: Path,
     dataloader: AV2SensorDataLoader,
     sequence: str,
     target_camera: str,
@@ -561,9 +658,14 @@ def _build_av2_target_cameras(
     rolling_shutter_time: float,
     time_to_center_pixel: float,
     appearance_embedding: Optional[torch.Tensor] = None,
-) -> Tuple[Cameras, List[int]]:
-    pinhole_camera = dataloader.get_log_pinhole_camera(sequence, target_camera)
-    camera_extrinsics = pinhole_camera.ego_SE3_cam.transform_matrix.copy()
+    fallback_reference_camera: Optional[str] = None,
+) -> Tuple[Cameras, List[int], Dict[str, Any]]:
+    intrinsics, width_px, height_px, camera_extrinsics, calibration_info = _get_av2_camera_calibration(
+        split_root=split_root,
+        sequence=sequence,
+        camera_name=target_camera,
+        fallback_reference_camera=fallback_reference_camera,
+    )
     camera_extrinsics[:3, :3] = camera_extrinsics[:3, :3] @ OPENCV_TO_NERFSTUDIO
 
     timestamps_ns: List[int] = []
@@ -577,7 +679,6 @@ def _build_av2_target_cameras(
         timestamps_ns.append(timestamp_ns)
         relative_times.append((timestamp_ns / 1e9) - time_offset)
 
-    intrinsics = pinhole_camera.intrinsics.K
     num_frames = len(image_paths)
     poses_tensor = torch.stack(poses, dim=0).float()
     times_tensor = torch.tensor(relative_times, dtype=torch.float32).unsqueeze(-1)
@@ -616,24 +717,30 @@ def _build_av2_target_cameras(
         fy=torch.full((num_frames, 1), float(intrinsics[1, 1]), dtype=torch.float32),
         cx=torch.full((num_frames, 1), float(intrinsics[0, 2]), dtype=torch.float32),
         cy=torch.full((num_frames, 1), float(intrinsics[1, 2]), dtype=torch.float32),
-        width=torch.full((num_frames, 1), int(pinhole_camera.intrinsics.width_px), dtype=torch.int64),
-        height=torch.full((num_frames, 1), int(pinhole_camera.intrinsics.height_px), dtype=torch.int64),
+        width=torch.full((num_frames, 1), width_px, dtype=torch.int64),
+        height=torch.full((num_frames, 1), height_px, dtype=torch.int64),
         camera_type=CameraType.PERSPECTIVE,
         times=times_tensor,
         metadata=metadata,
     )
-    return cameras, timestamps_ns
+    return cameras, timestamps_ns, calibration_info
 
 
 def _get_av2_camera_to_worlds(
+    split_root: Path,
     dataloader: AV2SensorDataLoader,
     sequence: str,
     camera_name: str,
     timestamps_ns: List[int],
     world_transform: torch.Tensor,
+    fallback_reference_camera: Optional[str] = None,
 ) -> torch.Tensor:
-    pinhole_camera = dataloader.get_log_pinhole_camera(sequence, camera_name)
-    camera_extrinsics = pinhole_camera.ego_SE3_cam.transform_matrix.copy()
+    _, _, _, camera_extrinsics, _ = _get_av2_camera_calibration(
+        split_root=split_root,
+        sequence=sequence,
+        camera_name=camera_name,
+        fallback_reference_camera=fallback_reference_camera,
+    )
     camera_extrinsics[:3, :3] = camera_extrinsics[:3, :3] @ OPENCV_TO_NERFSTUDIO
 
     poses = []
@@ -714,6 +821,7 @@ def _write_av2_render_manifest(
     target_camera: str,
     appearance_sensor: str,
     reference_camera: Optional[str],
+    calibration_info: Optional[Dict[str, Any]],
     timestamps_ns: List[int],
     image_paths: List[Path],
     relative_times: torch.Tensor,
@@ -729,6 +837,7 @@ def _write_av2_render_manifest(
         "target_camera": target_camera,
         "appearance_sensor": appearance_sensor,
         "reference_camera": reference_camera,
+        "calibration_info": calibration_info,
         "num_frames": len(timestamps_ns),
         "timestamps_ns": timestamps_ns,
         "source_images": [str(path) for path in image_paths],
@@ -1592,7 +1701,8 @@ class RenderAV2TargetCamera(BaseRender):
             )
             used_fitted_appearance = appearance_override is not None
         dataparser_config = pipeline.datamanager.dataparser.config
-        cameras, timestamps_ns = _build_av2_target_cameras(
+        cameras, timestamps_ns, calibration_info = _build_av2_target_cameras(
+            split_root=split_root,
             dataloader=dataloader,
             sequence=sequence,
             target_camera=self.target_camera,
@@ -1603,16 +1713,19 @@ class RenderAV2TargetCamera(BaseRender):
             rolling_shutter_time=float(dataparser_config.rolling_shutter_time),
             time_to_center_pixel=float(dataparser_config.time_to_center_pixel),
             appearance_embedding=appearance_override,
+            fallback_reference_camera=self.reference_camera or self.appearance_sensor,
         )
         reference_camera = self.reference_camera or self.appearance_sensor
         reference_delta = None
         if reference_camera:
             reference_camera_to_worlds = _get_av2_camera_to_worlds(
+                split_root=split_root,
                 dataloader=dataloader,
                 sequence=sequence,
                 camera_name=reference_camera,
                 timestamps_ns=timestamps_ns,
                 world_transform=world_transform,
+                fallback_reference_camera=reference_camera,
             )
             reference_delta = _compute_reference_camera_delta(
                 reference_camera_to_worlds=reference_camera_to_worlds,
@@ -1626,6 +1739,11 @@ class RenderAV2TargetCamera(BaseRender):
         if used_fitted_appearance:
             CONSOLE.print(f"Using fitted appearance override from {self.appearance_sidecar}")
         CONSOLE.print(f"First timestamp: {timestamps_ns[0]}, last timestamp: {timestamps_ns[-1]}, split: {data_split}")
+        if calibration_info.get("used_fallback", False):
+            CONSOLE.print(
+                f"Using fallback extrinsic for {self.target_camera} from {calibration_info['reference_camera']} "
+                f"(estimated from {calibration_info['num_scenes_used']} scenes)"
+            )
         if reference_delta is not None:
             CONSOLE.print(
                 f"{reference_camera} -> {self.target_camera} translation (m): "
@@ -1672,6 +1790,7 @@ class RenderAV2TargetCamera(BaseRender):
             target_camera=self.target_camera,
             appearance_sensor=self.appearance_sensor,
             reference_camera=reference_camera,
+            calibration_info=calibration_info,
             timestamps_ns=timestamps_ns,
             image_paths=selected_image_paths,
             relative_times=cameras.times,
@@ -1788,7 +1907,8 @@ class FitAV2StereoAppearance:
             image_paths = dataloader.get_ordered_log_cam_fpaths(sequence, target_camera)
             selected_image_paths = _slice_frame_paths(image_paths, self.start_frame, self.max_frames)
             donor_sensor_idx = int(sensor_name_to_idx[donor_sensor])
-            cameras, timestamps_ns = _build_av2_target_cameras(
+            cameras, timestamps_ns, _ = _build_av2_target_cameras(
+                split_root=split_root,
                 dataloader=dataloader,
                 sequence=sequence,
                 target_camera=target_camera,
@@ -1798,6 +1918,7 @@ class FitAV2StereoAppearance:
                 appearance_sensor_idx=donor_sensor_idx,
                 rolling_shutter_time=float(dataparser_config.rolling_shutter_time),
                 time_to_center_pixel=float(dataparser_config.time_to_center_pixel),
+                fallback_reference_camera=donor_sensor,
             )
             if self.downscale_factor != 1.0:
                 cameras.rescale_output_resolution(1.0 / self.downscale_factor)
