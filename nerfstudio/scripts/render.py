@@ -639,6 +639,19 @@ def _infer_video_seconds_from_times(times: torch.Tensor) -> float:
     return times.shape[0] / fps
 
 
+AV2_CAMERA_TO_BOTTOM_RIGHT_CROP = {
+    "ring_front_center": (250, 0),
+    "ring_front_left": (0, 0),
+    "ring_front_right": (0, 0),
+    "ring_rear_left": (250, 0),
+    "ring_rear_right": (250, 0),
+    "ring_side_left": (0, 0),
+    "ring_side_right": (0, 0),
+    "stereo_front_left": (0, 0),
+    "stereo_front_right": (0, 0),
+}
+
+
 def _read_av2_intrinsics(scene_dir: Path, camera_name: str) -> Tuple[np.ndarray, int, int]:
     intrinsics_df = pd.read_feather(scene_dir / "calibration" / "intrinsics.feather")
     rows = intrinsics_df[intrinsics_df["sensor_name"] == camera_name]
@@ -650,7 +663,8 @@ def _read_av2_intrinsics(scene_dir: Path, camera_name: str) -> Tuple[np.ndarray,
     intrinsics[1, 1] = float(params["fy_px"])
     intrinsics[0, 2] = float(params["cx_px"])
     intrinsics[1, 2] = float(params["cy_px"])
-    return intrinsics, int(params["width_px"]), int(params["height_px"])
+    crop_bottom_px, crop_right_px = AV2_CAMERA_TO_BOTTOM_RIGHT_CROP.get(camera_name, (0, 0))
+    return intrinsics, int(params["width_px"]) - crop_right_px, int(params["height_px"]) - crop_bottom_px
 
 
 def _read_av2_sensor_extrinsic(scene_dir: Path, camera_name: str) -> np.ndarray:
