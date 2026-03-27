@@ -747,6 +747,7 @@ def _build_av2_target_cameras(
     sequence: str,
     target_camera: str,
     image_paths: List[Path],
+    velocity_image_paths: Optional[List[Path]],
     world_transform: torch.Tensor,
     time_offset: float,
     appearance_sensor_idx: int,
@@ -763,35 +764,53 @@ def _build_av2_target_cameras(
     )
     camera_extrinsics[:3, :3] = camera_extrinsics[:3, :3] @ OPENCV_TO_NERFSTUDIO
 
-    timestamps_ns: List[int] = []
-    poses = []
-    relative_times = []
-    for image_path in image_paths:
+    trajectory_image_paths = velocity_image_paths if velocity_image_paths is not None else image_paths
+    all_timestamps_ns: List[int] = []
+    all_poses = []
+    all_relative_times = []
+    for image_path in trajectory_image_paths:
         timestamp_ns = int(image_path.stem)
         ego_to_world = dataloader.get_city_SE3_ego(sequence, timestamp_ns)
         raw_camera_to_world = torch.tensor(ego_to_world.transform_matrix @ camera_extrinsics, dtype=torch.float32)
-        poses.append((world_transform @ raw_camera_to_world)[:3, :4].float())
-        timestamps_ns.append(timestamp_ns)
-        relative_times.append((timestamp_ns / 1e9) - time_offset)
+        all_poses.append((world_transform @ raw_camera_to_world)[:3, :4].float())
+        all_timestamps_ns.append(timestamp_ns)
+        all_relative_times.append((timestamp_ns / 1e9) - time_offset)
 
-    num_frames = len(image_paths)
-    poses_tensor = torch.stack(poses, dim=0).float()
-    times_tensor = torch.tensor(relative_times, dtype=torch.float32).unsqueeze(-1)
-    velocities = torch.zeros((num_frames, 3), dtype=torch.float32)
-    linear_velocities_local = torch.zeros((num_frames, 3), dtype=torch.float32)
-    angular_velocities_local = torch.zeros((num_frames, 3), dtype=torch.float32)
-    if num_frames > 1:
-        translation_velo = (poses_tensor[1:, :3, 3] - poses_tensor[:-1, :3, 3]) / (times_tensor[1:] - times_tensor[:-1])
-        next_cam = poses_tensor[1:]
-        prev_cam = poses_tensor[:-1]
-        next_cam_in_prev_cam = pose_utils.to4x4(pose_utils.inverse(prev_cam)) @ pose_utils.to4x4(next_cam)
-        translation_velo_cam_ref = next_cam_in_prev_cam[:, :3, 3] / (times_tensor[1:] - times_tensor[:-1])
-        angular_velo = pose_utils.rotation_difference(poses_tensor[:-1, :3, :3], poses_tensor[1:, :3, :3]) / (
-            times_tensor[1:] - times_tensor[:-1]
+    num_all_frames = len(trajectory_image_paths)
+    all_poses_tensor = torch.stack(all_poses, dim=0).float()
+    all_times_tensor = torch.tensor(all_relative_times, dtype=torch.float32).unsqueeze(-1)
+    all_velocities = torch.zeros((num_all_frames, 3), dtype=torch.float32)
+    all_linear_velocities_local = torch.zeros((num_all_frames, 3), dtype=torch.float32)
+    all_angular_velocities_local = torch.zeros((num_all_frames, 3), dtype=torch.float32)
+    if num_all_frames > 1:
+        translation_velo = (all_poses_tensor[1:, :3, 3] - all_poses_tensor[:-1, :3, 3]) / (
+            all_times_tensor[1:] - all_times_tensor[:-1]
         )
-        velocities = torch.cat((translation_velo, translation_velo[-1:]), 0).float()
-        linear_velocities_local = torch.cat((translation_velo_cam_ref, translation_velo_cam_ref[-1:]), 0).float()
-        angular_velocities_local = torch.cat((angular_velo, angular_velo[-1:]), 0).float()
+        next_cam = all_poses_tensor[1:]
+        prev_cam = all_poses_tensor[:-1]
+        next_cam_in_prev_cam = pose_utils.to4x4(pose_utils.inverse(prev_cam)) @ pose_utils.to4x4(next_cam)
+        translation_velo_cam_ref = next_cam_in_prev_cam[:, :3, 3] / (all_times_tensor[1:] - all_times_tensor[:-1])
+        angular_velo = pose_utils.rotation_difference(
+            all_poses_tensor[:-1, :3, :3], all_poses_tensor[1:, :3, :3]
+        ) / (
+            all_times_tensor[1:] - all_times_tensor[:-1]
+        )
+        all_velocities = torch.cat((translation_velo, translation_velo[-1:]), 0).float()
+        all_linear_velocities_local = torch.cat((translation_velo_cam_ref, translation_velo_cam_ref[-1:]), 0).float()
+        all_angular_velocities_local = torch.cat((angular_velo, angular_velo[-1:]), 0).float()
+
+    timestamp_to_index = {timestamp_ns: idx for idx, timestamp_ns in enumerate(all_timestamps_ns)}
+    selected_indices = torch.tensor(
+        [timestamp_to_index[int(path.stem)] for path in image_paths],
+        dtype=torch.long,
+    )
+    poses_tensor = all_poses_tensor.index_select(0, selected_indices)
+    times_tensor = all_times_tensor.index_select(0, selected_indices)
+    velocities = all_velocities.index_select(0, selected_indices)
+    linear_velocities_local = all_linear_velocities_local.index_select(0, selected_indices)
+    angular_velocities_local = all_angular_velocities_local.index_select(0, selected_indices)
+    timestamps_ns = [int(path.stem) for path in image_paths]
+    num_frames = len(image_paths)
 
     metadata = {
         "sensor_idxs": torch.full((num_frames, 1), appearance_sensor_idx, dtype=torch.int64),
@@ -1831,6 +1850,7 @@ class RenderAV2TargetCamera(BaseRender):
             sequence=sequence,
             target_camera=self.target_camera,
             image_paths=selected_image_paths,
+            velocity_image_paths=image_paths,
             world_transform=world_transform,
             time_offset=time_offset,
             appearance_sensor_idx=appearance_sensor_idx,
@@ -2042,6 +2062,7 @@ class FitAV2StereoAppearance:
                 sequence=sequence,
                 target_camera=target_camera,
                 image_paths=selected_image_paths,
+                velocity_image_paths=image_paths,
                 world_transform=world_transform,
                 time_offset=time_offset,
                 appearance_sensor_idx=donor_sensor_idx,
@@ -2228,6 +2249,7 @@ class FitAV2StereoPhotometric:
                 sequence=sequence,
                 target_camera=target_camera,
                 image_paths=selected_image_paths,
+                velocity_image_paths=image_paths,
                 world_transform=world_transform,
                 time_offset=time_offset,
                 appearance_sensor_idx=donor_sensor_idx,
