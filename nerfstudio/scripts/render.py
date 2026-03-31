@@ -30,7 +30,7 @@ import sys
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import mediapy as media
 import numpy as np
@@ -40,6 +40,7 @@ import tyro
 import viser.transforms as tf
 from av2.datasets.sensor.av2_sensor_dataloader import AV2SensorDataLoader
 from jaxtyping import Float
+from PIL import Image
 from rich import box, style
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
@@ -74,6 +75,7 @@ from nerfstudio.utils.rich_utils import CONSOLE, ItersPerSecColumn
 from nerfstudio.utils.scripts import run_command
 
 AV2_SPLITS = ("train", "val", "test", "mini", "mini_val", "mini_test")
+DEFAULT_AV2_STEREO_APPEARANCE_SENSOR = "ring_front_center"
 
 
 def _render_trajectory_video(
@@ -92,6 +94,7 @@ def _render_trajectory_video(
     colormap_options: colormaps.ColormapOptions = colormaps.ColormapOptions(),
     render_nearest_camera=False,
     check_occlusions: bool = False,
+    rgb_postprocess_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> None:
     """Helper function to create a video of the spiral trajectory.
 
@@ -237,6 +240,8 @@ def _render_trajectory_video(
                             .numpy()
                         )
                     else:
+                        if rendered_output_name == "rgb" and rgb_postprocess_fn is not None:
+                            output_image = rgb_postprocess_fn(output_image)
                         output_image = (
                             colormaps.apply_colormap(
                                 image=output_image,
@@ -451,10 +456,124 @@ def _infer_scene_id_from_load_config(load_config: Path) -> str:
     """Infer the AV2 scene id from outputs/.../splatad/{scene_id}/{timestamp}/config.yml."""
     if load_config.name != "config.yml":
         raise ValueError(f"Expected load_config to point to config.yml, got {load_config}")
-    scene_id = load_config.parent.parent.name
+    if (load_config.parent / "nerfstudio_models").exists():
+        scene_id = load_config.parent.name
+    else:
+        scene_id = load_config.parent.parent.name
     if not scene_id:
         raise ValueError(f"Could not infer scene id from {load_config}")
     return scene_id
+
+
+def _get_default_stereo_photometric_sidecar_path(load_config: Path) -> Path:
+    if (load_config.parent / "nerfstudio_models").exists():
+        return load_config.parent / "nerfstudio_models" / "sidecars" / "stereo_photometric.pt"
+    return load_config.parent.parent / "nerfstudio_models" / "sidecars" / "stereo_photometric.pt"
+
+
+def _load_stereo_photometric_sidecar(sidecar_path: Path) -> Dict[str, Any]:
+    sidecar = torch.load(sidecar_path, map_location="cpu")
+    if not isinstance(sidecar, dict) or "entries" not in sidecar:
+        raise ValueError(f"Invalid stereo photometric sidecar: {sidecar_path}")
+    return sidecar
+
+
+def _save_stereo_photometric_sidecar(
+    sidecar_path: Path,
+    *,
+    entries: Dict[str, Dict[str, Any]],
+    fit_settings: Dict[str, Any],
+) -> None:
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "format": "stereo_photometric_v1",
+            "entries": entries,
+            "fit_settings": fit_settings,
+        },
+        sidecar_path,
+    )
+
+
+def _rgb_to_luminance(rgb: torch.Tensor) -> torch.Tensor:
+    weights = torch.tensor([0.299, 0.587, 0.114], dtype=rgb.dtype, device=rgb.device)
+    return (rgb * weights).sum(dim=-1, keepdim=True)
+
+
+def _extract_grayscale_target(image: torch.Tensor) -> torch.Tensor:
+    if image.shape[-1] == 1:
+        return image
+    return image[..., :1]
+
+
+def _apply_tone_mapped_grayscale_mapping(
+    rgb: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor, gamma: torch.Tensor
+) -> torch.Tensor:
+    luminance = _rgb_to_luminance(rgb)
+    gamma = torch.clamp(gamma, min=1e-3)
+    gray = torch.clamp(scale * torch.pow(torch.clamp(luminance, 0.0, 1.0), gamma) + bias, 0.0, 1.0)
+    return gray.expand(*rgb.shape[:-1], 3)
+
+
+def _build_photometric_postprocess(entry: Dict[str, Any]) -> Callable[[torch.Tensor], torch.Tensor]:
+    scale = torch.as_tensor(entry["scale"], dtype=torch.float32)
+    bias = torch.as_tensor(entry["bias"], dtype=torch.float32)
+    gamma = torch.as_tensor(entry.get("gamma", 1.0), dtype=torch.float32)
+
+    def _postprocess(rgb: torch.Tensor) -> torch.Tensor:
+        return _apply_tone_mapped_grayscale_mapping(
+            rgb,
+            scale.to(rgb.device),
+            bias.to(rgb.device),
+            gamma.to(rgb.device),
+        )
+
+    return _postprocess
+
+
+def _load_av2_rgb_image(image_path: Path, height: int, width: int) -> torch.Tensor:
+    image = np.asarray(Image.open(image_path), dtype=np.float32)
+    if image.ndim == 2:
+        image = np.repeat(image[..., None], 3, axis=-1)
+    image = torch.from_numpy(image[..., :3] / 255.0)
+    image = image[:height, :width]
+    if image.shape[0] != height or image.shape[1] != width:
+        image = torch.nn.functional.interpolate(
+            image.permute(2, 0, 1).unsqueeze(0),
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )[0].permute(1, 2, 0)
+    return image
+
+
+def _find_latest_scene_config(scene_dir: Path) -> Path:
+    direct_config = scene_dir / "config.yml"
+    if direct_config.exists():
+        return direct_config
+    candidates = sorted(scene_dir.glob("*/config.yml"))
+    if not candidates:
+        raise FileNotFoundError(f"No config.yml found under {scene_dir}")
+    return candidates[-1]
+
+
+def _collect_scene_configs(
+    outputs_root: Path,
+    scene_ids: Sequence[str],
+    max_scenes: Optional[int],
+) -> List[Path]:
+    selected_scene_ids = set(scene_ids)
+    config_paths = []
+    for scene_dir in sorted(path for path in outputs_root.iterdir() if path.is_dir()):
+        if selected_scene_ids and scene_dir.name not in selected_scene_ids:
+            continue
+        config_paths.append(_find_latest_scene_config(scene_dir))
+        if max_scenes is not None and len(config_paths) >= max_scenes:
+            break
+    if not config_paths:
+        raise ValueError(f"No scene configs found under {outputs_root}")
+    return config_paths
 
 
 def _resolve_av2_split_root(
@@ -652,6 +771,8 @@ def _write_av2_render_manifest(
     relative_times: torch.Tensor,
     sensor_idx_to_name: Dict[int, str],
     reference_delta: Optional[Dict[str, Any]] = None,
+    photometric_sidecar: Optional[Path] = None,
+    used_photometric_mapping: bool = False,
 ) -> None:
     manifest = {
         "load_config": str(load_config),
@@ -665,9 +786,12 @@ def _write_av2_render_manifest(
         "source_images": [str(path) for path in image_paths],
         "relative_times_seconds": [float(value) for value in relative_times[:, 0].tolist()],
         "sensor_idx_to_name": {str(idx): name for idx, name in sensor_idx_to_name.items()},
+        "used_photometric_mapping": used_photometric_mapping,
     }
     if reference_delta is not None:
         manifest["reference_to_target_delta"] = reference_delta
+    if photometric_sidecar is not None:
+        manifest["photometric_sidecar"] = str(photometric_sidecar)
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
@@ -1434,6 +1558,9 @@ class RenderAV2TargetCamera(BaseRender):
     appearance_sensor: str = "ring_front_right"
     """Training camera whose appearance embedding should be reused."""
 
+    photometric_sidecar: Optional[Path] = None
+    """Optional sidecar file containing fitted grayscale photometric calibration."""
+
     reference_camera: Optional[str] = None
     """Optional camera used when exporting rigid camera-to-camera deltas. Defaults to appearance_sensor."""
 
@@ -1471,6 +1598,15 @@ class RenderAV2TargetCamera(BaseRender):
         dataparser_outputs = pipeline.datamanager.train_dataparser_outputs
         sensor_idx_to_name = dataparser_outputs.metadata["sensor_idx_to_name"]
         sensor_name_to_idx = {name: idx for idx, name in sensor_idx_to_name.items()}
+        photometric_entry = None
+        rgb_postprocess_fn = None
+        used_photometric_mapping = False
+        if self.photometric_sidecar is not None:
+            photometric_sidecar = _load_stereo_photometric_sidecar(self.photometric_sidecar)
+            photometric_entry = photometric_sidecar.get("entries", {}).get(self.target_camera)
+            donor_sensor = photometric_entry.get("appearance_sensor") if photometric_entry is not None else None
+            if donor_sensor is not None and self.appearance_sensor == "ring_front_right":
+                self.appearance_sensor = donor_sensor
         if self.appearance_sensor not in sensor_name_to_idx:
             available = ", ".join(sensor_name_to_idx)
             raise ValueError(f"appearance_sensor {self.appearance_sensor!r} not found. Available sensors: {available}")
@@ -1484,6 +1620,15 @@ class RenderAV2TargetCamera(BaseRender):
         time_offset = float(dataparser_outputs.time_offset)
         appearance_sensor_idx = int(sensor_name_to_idx[self.appearance_sensor])
         dataparser_config = pipeline.datamanager.dataparser.config
+        if photometric_entry is not None:
+            donor_sensor = photometric_entry.get("appearance_sensor")
+            if donor_sensor is not None and donor_sensor != self.appearance_sensor:
+                CONSOLE.print(
+                    f"[yellow]Photometric sidecar for {self.target_camera} was fit using {donor_sensor}, "
+                    f"but render is using {self.appearance_sensor} appearance.[/yellow]"
+                )
+            rgb_postprocess_fn = _build_photometric_postprocess(photometric_entry)
+            used_photometric_mapping = True
         cameras, timestamps_ns = _build_av2_target_cameras(
             dataloader=dataloader,
             sequence=sequence,
@@ -1514,6 +1659,8 @@ class RenderAV2TargetCamera(BaseRender):
         CONSOLE.print(
             f"Rendering {len(selected_image_paths)} frames from {self.target_camera} using {self.appearance_sensor} appearance"
         )
+        if used_photometric_mapping:
+            CONSOLE.print(f"Using fitted photometric mapping from {self.photometric_sidecar}")
         CONSOLE.print(f"First timestamp: {timestamps_ns[0]}, last timestamp: {timestamps_ns[-1]}, split: {data_split}")
         if reference_delta is not None:
             CONSOLE.print(
@@ -1545,6 +1692,7 @@ class RenderAV2TargetCamera(BaseRender):
             colormap_options=self.colormap_options,
             render_nearest_camera=self.render_nearest_camera,
             check_occlusions=self.check_occlusions,
+            rgb_postprocess_fn=rgb_postprocess_fn,
         )
 
         if self.output_format == "images":
@@ -1566,8 +1714,218 @@ class RenderAV2TargetCamera(BaseRender):
             relative_times=cameras.times,
             sensor_idx_to_name={int(idx): name for idx, name in sensor_idx_to_name.items()},
             reference_delta=reference_delta,
+            photometric_sidecar=self.photometric_sidecar,
+            used_photometric_mapping=used_photometric_mapping,
         )
         CONSOLE.print(f"[bold][green]:glowing_star: Render manifest saved to {manifest_path}")
+
+
+@dataclass
+class FitAV2GlobalStereoPhotometric:
+    """Fit one global grayscale photometric mapping per stereo camera across many scenes."""
+
+    outputs_root: Path
+    """Root directory containing per-scene SplatAD outputs, e.g. outputs/unnamed/splatad."""
+
+    output_path: Optional[Path] = None
+    """Optional output sidecar path. Defaults to <outputs_root>/stereo_photometric_global.pt."""
+
+    data_root: Path = Path("data/av2")
+    """Root directory containing the AV2 dataset."""
+
+    appearance_sensor: str = DEFAULT_AV2_STEREO_APPEARANCE_SENSOR
+    """Training camera appearance used to produce the source stereo-view renders."""
+
+    target_cameras: Tuple[str, ...] = ("stereo_front_left", "stereo_front_right")
+    """AV2 camera streams to fit grayscale mappings for."""
+
+    scene_ids: Tuple[str, ...] = tuple()
+    """Optional subset of scene ids to include. Defaults to all scenes under outputs_root."""
+
+    max_scenes: Optional[int] = None
+    """Optional cap on the number of scenes to include."""
+
+    split: Optional[Literal["train", "val", "test", "mini", "mini_val", "mini_test"]] = None
+    """Dataset split override. If omitted, infer the split by searching the dataset."""
+
+    start_frame: int = 0
+    """First frame index to use per scene."""
+
+    max_frames: Optional[int] = None
+    """Maximum number of frames to use per scene and stereo camera."""
+
+    downscale_factor: float = 1.0
+    """Downscale factor applied when rendering source images for fitting."""
+
+    max_steps: int = 1000
+    """Number of optimization steps for the global tone-mapping parameters."""
+
+    learning_rate: float = 3e-2
+    """Learning rate for the global tone-mapping optimization."""
+
+    sample_pixels_per_frame: int = 50000
+    """Maximum number of sampled pixels per frame included in the fit."""
+
+    eval_num_rays_per_chunk: Optional[int] = None
+    """Optional eval chunk size override."""
+
+    def main(self) -> None:
+        config_paths = _collect_scene_configs(self.outputs_root, self.scene_ids, self.max_scenes)
+        output_path = self.output_path or (self.outputs_root / "stereo_photometric_global.pt")
+
+        camera_samples: Dict[str, Dict[str, Any]] = {
+            target_camera: {"pred": [], "gt": [], "scene_ids": [], "num_frames": 0}
+            for target_camera in self.target_cameras
+        }
+
+        CONSOLE.print(
+            f"Collecting global stereo photometric samples from {len(config_paths)} scenes using {self.appearance_sensor} appearance"
+        )
+
+        for scene_idx, config_path in enumerate(config_paths, start=1):
+            scene_id = _infer_scene_id_from_load_config(config_path)
+            CONSOLE.print(f"[{scene_idx}/{len(config_paths)}] Loading {scene_id}")
+
+            _, pipeline, _, _ = eval_setup(
+                config_path,
+                eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+                test_mode="inference",
+                update_config_callback=streamline_ad_config,
+                strict_load=False,
+            )
+
+            model = pipeline.model
+            model.eval()
+            dataparser_outputs = pipeline.datamanager.train_dataparser_outputs
+            sensor_idx_to_name = dataparser_outputs.metadata["sensor_idx_to_name"]
+            sensor_name_to_idx = {name: idx for idx, name in sensor_idx_to_name.items()}
+            if self.appearance_sensor not in sensor_name_to_idx:
+                available = ", ".join(sensor_name_to_idx)
+                raise ValueError(
+                    f"appearance_sensor {self.appearance_sensor!r} not found in {scene_id}. Available sensors: {available}"
+                )
+
+            split_root, _ = _resolve_av2_split_root(self.data_root, scene_id, self.split)
+            dataloader = AV2SensorDataLoader(split_root, split_root)
+            world_transform = pose_utils.to4x4(dataparser_outputs.dataparser_transform).cpu().float()
+            time_offset = float(dataparser_outputs.time_offset)
+            donor_sensor_idx = int(sensor_name_to_idx[self.appearance_sensor])
+            dataparser_config = pipeline.datamanager.dataparser.config
+
+            with torch.no_grad():
+                for target_camera in self.target_cameras:
+                    image_paths = dataloader.get_ordered_log_cam_fpaths(scene_id, target_camera)
+                    selected_image_paths = _slice_frame_paths(image_paths, self.start_frame, self.max_frames)
+                    cameras, _ = _build_av2_target_cameras(
+                        dataloader=dataloader,
+                        sequence=scene_id,
+                        target_camera=target_camera,
+                        image_paths=selected_image_paths,
+                        world_transform=world_transform,
+                        time_offset=time_offset,
+                        appearance_sensor_idx=donor_sensor_idx,
+                        rolling_shutter_time=float(dataparser_config.rolling_shutter_time),
+                        time_to_center_pixel=float(dataparser_config.time_to_center_pixel),
+                    )
+                    if self.downscale_factor != 1.0:
+                        cameras.rescale_output_resolution(1.0 / self.downscale_factor)
+
+                    for frame_idx, image_path in enumerate(selected_image_paths):
+                        gt_image = _load_av2_rgb_image(
+                            image_path, int(cameras.height[frame_idx].item()), int(cameras.width[frame_idx].item())
+                        )
+                        gt_gray = _extract_grayscale_target(gt_image).reshape(-1)
+                        pred_rgb = model.get_outputs(cameras[frame_idx : frame_idx + 1].to(model.device))["rgb"].detach().cpu()
+                        pred_gray = _rgb_to_luminance(pred_rgb).reshape(-1)
+
+                        if pred_gray.numel() > self.sample_pixels_per_frame:
+                            sample_idx = torch.randperm(pred_gray.numel())[: self.sample_pixels_per_frame]
+                            pred_gray = pred_gray[sample_idx]
+                            gt_gray = gt_gray[sample_idx]
+
+                        camera_samples[target_camera]["pred"].append(pred_gray)
+                        camera_samples[target_camera]["gt"].append(gt_gray)
+                        camera_samples[target_camera]["num_frames"] += 1
+
+                    camera_samples[target_camera]["scene_ids"].append(scene_id)
+
+            del pipeline
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        entries: Dict[str, Dict[str, Any]] = {}
+        for target_camera in self.target_cameras:
+            pred_samples = camera_samples[target_camera]["pred"]
+            gt_samples = camera_samples[target_camera]["gt"]
+            if not pred_samples:
+                raise ValueError(f"No samples collected for {target_camera}")
+
+            pred_gray_all = torch.cat(pred_samples, dim=0)
+            gt_gray_all = torch.cat(gt_samples, dim=0)
+            baseline_mean_l1 = torch.abs(pred_gray_all - gt_gray_all).mean().item()
+
+            scale_param = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+            bias_param = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+            log_gamma_param = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+            optimizer = torch.optim.Adam((scale_param, bias_param, log_gamma_param), lr=self.learning_rate)
+
+            for _ in range(self.max_steps):
+                gamma = torch.exp(log_gamma_param)
+                mapped = torch.clamp(
+                    scale_param * torch.pow(torch.clamp(pred_gray_all, 0.0, 1.0), gamma) + bias_param,
+                    0.0,
+                    1.0,
+                )
+                loss = torch.abs(mapped - gt_gray_all).mean()
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+
+            scale = float(scale_param.detach().item())
+            bias = float(bias_param.detach().item())
+            gamma = float(torch.exp(log_gamma_param.detach()).item())
+            fitted_mean_l1 = torch.abs(
+                torch.clamp(
+                    scale * torch.pow(torch.clamp(pred_gray_all, 0.0, 1.0), gamma) + bias,
+                    0.0,
+                    1.0,
+                )
+                - gt_gray_all
+            ).mean().item()
+
+            entries[target_camera] = {
+                "appearance_sensor": self.appearance_sensor,
+                "scale": scale,
+                "bias": bias,
+                "gamma": gamma,
+                "baseline_mean_l1": baseline_mean_l1,
+                "fitted_mean_l1": fitted_mean_l1,
+                "num_scenes": len(camera_samples[target_camera]["scene_ids"]),
+                "num_frames": camera_samples[target_camera]["num_frames"],
+            }
+            CONSOLE.print(
+                f"{target_camera}: scale={scale:.6f}, bias={bias:.6f}, gamma={gamma:.6f}, "
+                f"mean L1 {baseline_mean_l1:.6f} -> {fitted_mean_l1:.6f}"
+            )
+
+        _save_stereo_photometric_sidecar(
+            output_path,
+            entries=entries,
+            fit_settings={
+                "outputs_root": str(self.outputs_root),
+                "data_root": str(self.data_root),
+                "appearance_sensor": self.appearance_sensor,
+                "target_cameras": list(self.target_cameras),
+                "scene_ids": [_infer_scene_id_from_load_config(path) for path in config_paths],
+                "start_frame": self.start_frame,
+                "max_frames": self.max_frames,
+                "downscale_factor": self.downscale_factor,
+                "max_steps": self.max_steps,
+                "learning_rate": self.learning_rate,
+                "sample_pixels_per_frame": self.sample_pixels_per_frame,
+            },
+        )
+        CONSOLE.print(f"[bold][green]:glowing_star: Global stereo photometric sidecar saved to {output_path}")
 
 
 def plot_lidar_points(points, output_path, cmin=-6.0, cmax=5.0, width=1920, height=1080, ranges=[100, 200, 10]):
@@ -1655,6 +2013,7 @@ Commands = tyro.conf.FlagConversionOff[
         Annotated[SpiralRender, tyro.conf.subcommand(name="spiral")],
         Annotated[DatasetRender, tyro.conf.subcommand(name="dataset")],
         Annotated[RenderAV2TargetCamera, tyro.conf.subcommand(name="av2-target-camera")],
+        Annotated[FitAV2GlobalStereoPhotometric, tyro.conf.subcommand(name="fit-av2-global-stereo-photometric")],
     ]
 ]
 
