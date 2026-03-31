@@ -457,9 +457,10 @@ def _infer_scene_id_from_load_config(load_config: Path) -> str:
     if load_config.name != "config.yml":
         raise ValueError(f"Expected load_config to point to config.yml, got {load_config}")
     if (load_config.parent / "nerfstudio_models").exists():
-        scene_id = load_config.parent.name
-    else:
+        # Layout: {scene_id}/{timestamp}/config.yml  (nerfstudio_models lives next to config.yml)
         scene_id = load_config.parent.parent.name
+    else:
+        scene_id = load_config.parent.name
     if not scene_id:
         raise ValueError(f"Could not infer scene id from {load_config}")
     return scene_id
@@ -1780,6 +1781,8 @@ class FitAV2GlobalStereoPhotometric:
     def main(self) -> None:
         config_paths = _collect_scene_configs(self.outputs_root, self.scene_ids, self.max_scenes)
         output_path = self.output_path or (self.outputs_root / "stereo_photometric_global.pt")
+        used_scene_ids: List[str] = []
+        skipped_scene_ids: List[str] = []
 
         camera_samples: Dict[str, Dict[str, Any]] = {
             target_camera: {"pred": [], "gt": [], "scene_ids": [], "num_frames": 0}
@@ -1813,7 +1816,17 @@ class FitAV2GlobalStereoPhotometric:
                     f"appearance_sensor {self.appearance_sensor!r} not found in {scene_id}. Available sensors: {available}"
                 )
 
-            split_root, _ = _resolve_av2_split_root(self.data_root, scene_id, self.split)
+            try:
+                split_root, _ = _resolve_av2_split_root(self.data_root, scene_id, self.split)
+            except FileNotFoundError:
+                skipped_scene_ids.append(scene_id)
+                CONSOLE.print(f"[yellow]Skipping {scene_id}: no matching AV2 sensor folder found under {self.data_root / 'sensor'}[/yellow]")
+                del pipeline
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+
+            used_scene_ids.append(scene_id)
             dataloader = AV2SensorDataLoader(split_root, split_root)
             world_transform = pose_utils.to4x4(dataparser_outputs.dataparser_transform).cpu().float()
             time_offset = float(dataparser_outputs.time_offset)
@@ -1861,12 +1874,18 @@ class FitAV2GlobalStereoPhotometric:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        if skipped_scene_ids:
+            CONSOLE.print(
+                f"[yellow]Skipped {len(skipped_scene_ids)} scene(s) without AV2 data: {', '.join(skipped_scene_ids)}[/yellow]"
+            )
+
         entries: Dict[str, Dict[str, Any]] = {}
         for target_camera in self.target_cameras:
             pred_samples = camera_samples[target_camera]["pred"]
             gt_samples = camera_samples[target_camera]["gt"]
             if not pred_samples:
-                raise ValueError(f"No samples collected for {target_camera}")
+                CONSOLE.print(f"[yellow]Skipping {target_camera}: no samples collected[/yellow]")
+                continue
 
             pred_gray_all = torch.cat(pred_samples, dim=0)
             gt_gray_all = torch.cat(gt_samples, dim=0)
@@ -1916,6 +1935,10 @@ class FitAV2GlobalStereoPhotometric:
                 f"mean L1 {baseline_mean_l1:.6f} -> {fitted_mean_l1:.6f}"
             )
 
+        if not entries:
+            CONSOLE.print("[yellow]No usable photometric samples were collected; skipping sidecar export.[/yellow]")
+            return
+
         _save_stereo_photometric_sidecar(
             output_path,
             entries=entries,
@@ -1924,7 +1947,8 @@ class FitAV2GlobalStereoPhotometric:
                 "data_root": str(self.data_root),
                 "appearance_sensor": self.appearance_sensor,
                 "target_cameras": list(self.target_cameras),
-                "scene_ids": [_infer_scene_id_from_load_config(path) for path in config_paths],
+                "scene_ids": used_scene_ids,
+                "skipped_scene_ids": skipped_scene_ids,
                 "start_frame": self.start_frame,
                 "max_frames": self.max_frames,
                 "downscale_factor": self.downscale_factor,
