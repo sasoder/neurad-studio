@@ -100,6 +100,7 @@ while IFS= read -r -d '' scene_dir; do
     "nerfstudio/scripts/render.py"
     "av2-target-camera"
     "--load-config" "$config_path"
+    "--sequence" "$scene_id"
     "--output-path" "$output_dir"
     "--target-camera" "$TARGET_CAMERA"
     "--appearance-sensor" "$APPEARANCE_SENSOR"
