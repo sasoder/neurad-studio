@@ -749,12 +749,14 @@ def _resolve_av2_output_path(
     output_format: Literal["images", "video"],
     scene_id: str,
     target_camera: str,
+    photometric_mode: bool = False,
 ) -> Path:
     if output_path != BaseRender.output_path:
         return output_path
+    target_name = f"{target_camera}_photometric" if photometric_mode else target_camera
     if output_format == "video":
-        return Path("renders") / scene_id / f"{target_camera}.mp4"
-    return Path("renders") / scene_id / target_camera
+        return Path("renders") / scene_id / f"{target_name}.mp4"
+    return Path("renders") / scene_id / target_name
 
 
 def _write_av2_render_manifest(
@@ -1585,7 +1587,13 @@ class RenderAV2TargetCamera(BaseRender):
     def main(self) -> None:
         scene_id = _infer_scene_id_from_load_config(self.load_config)
         sequence = self.sequence or scene_id
-        self.output_path = _resolve_av2_output_path(self.output_path, self.output_format, scene_id, self.target_camera)
+        self.output_path = _resolve_av2_output_path(
+            self.output_path,
+            self.output_format,
+            scene_id,
+            self.target_camera,
+            photometric_mode=self.photometric_sidecar is not None,
+        )
 
         _, pipeline, _, _ = eval_setup(
             self.load_config,
