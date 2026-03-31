@@ -135,10 +135,26 @@ def _fit_mapping(pred_gray: torch.Tensor, gt_gray: torch.Tensor, max_steps: int,
     }
 
 
+def _append_sample_chunks(bucket: Dict[str, Any], pred_gray: torch.Tensor, gt_gray: torch.Tensor, max_total_samples: int) -> None:
+    bucket["pred"].append(pred_gray.cpu())
+    bucket["gt"].append(gt_gray.cpu())
+    bucket["total_samples"] += pred_gray.numel()
+    if bucket["total_samples"] <= max_total_samples * 2:
+        return
+
+    pred_all = torch.cat(bucket["pred"], dim=0)
+    gt_all = torch.cat(bucket["gt"], dim=0)
+    sample_idx = torch.randperm(pred_all.numel())[:max_total_samples]
+    bucket["pred"] = [pred_all[sample_idx]]
+    bucket["gt"] = [gt_all[sample_idx]]
+    bucket["total_samples"] = max_total_samples
+
+
 def fit_command(args: argparse.Namespace) -> None:
     scene_dirs = _collect_scene_dirs(args.renders_root, args.scene_ids, args.max_scenes)
     camera_samples: Dict[str, Dict[str, Any]] = {
-        camera: {"pred": [], "gt": [], "num_frames": 0, "scene_ids": []} for camera in args.target_cameras
+        camera: {"pred": [], "gt": [], "total_samples": 0, "num_frames": 0, "scene_ids": []}
+        for camera in args.target_cameras
     }
 
     print(f"Collecting cached stereo photometric samples from {len(scene_dirs)} scenes")
@@ -177,8 +193,12 @@ def fit_command(args: argparse.Namespace) -> None:
                     pred_gray = pred_gray[sample_idx]
                     gt_gray = gt_gray[sample_idx]
 
-                camera_samples[target_camera]["pred"].append(pred_gray)
-                camera_samples[target_camera]["gt"].append(gt_gray)
+                _append_sample_chunks(
+                    camera_samples[target_camera],
+                    pred_gray,
+                    gt_gray,
+                    max_total_samples=args.max_total_samples_per_camera,
+                )
                 camera_samples[target_camera]["num_frames"] += 1
 
             camera_samples[target_camera]["scene_ids"].append(scene_dir.name)
@@ -193,6 +213,10 @@ def fit_command(args: argparse.Namespace) -> None:
 
         pred_gray = torch.cat(pred_chunks, dim=0).float()
         gt_gray = torch.cat(gt_chunks, dim=0).float()
+        if pred_gray.numel() > args.max_total_samples_per_camera:
+            sample_idx = torch.randperm(pred_gray.numel())[: args.max_total_samples_per_camera]
+            pred_gray = pred_gray[sample_idx]
+            gt_gray = gt_gray[sample_idx]
         fit = _fit_mapping(pred_gray, gt_gray, max_steps=args.max_steps, learning_rate=args.learning_rate)
         entries[target_camera] = {
             "appearance_sensor": args.appearance_sensor,
@@ -223,6 +247,7 @@ def fit_command(args: argparse.Namespace) -> None:
             "start_frame": args.start_frame,
             "max_frames": args.max_frames,
             "sample_pixels_per_frame": args.sample_pixels_per_frame,
+            "max_total_samples_per_camera": args.max_total_samples_per_camera,
             "max_steps": args.max_steps,
             "learning_rate": args.learning_rate,
         },
@@ -291,6 +316,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit_parser.add_argument("--start-frame", type=int, default=0)
     fit_parser.add_argument("--max-frames", type=int, default=None)
     fit_parser.add_argument("--sample-pixels-per-frame", type=int, default=1000)
+    fit_parser.add_argument("--max-total-samples-per-camera", type=int, default=500000)
     fit_parser.add_argument("--max-steps", type=int, default=300)
     fit_parser.add_argument("--learning-rate", type=float, default=0.03)
     fit_parser.set_defaults(func=fit_command)
