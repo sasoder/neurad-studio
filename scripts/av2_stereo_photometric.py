@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -11,6 +12,7 @@ import torch
 from PIL import Image
 
 DEFAULT_TARGET_CAMERAS = ("stereo_front_left", "stereo_front_right")
+SCENE_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 def _collect_scene_dirs(root: Path, scene_ids: Sequence[str], max_scenes: Optional[int]) -> List[Path]:
@@ -18,6 +20,8 @@ def _collect_scene_dirs(root: Path, scene_ids: Sequence[str], max_scenes: Option
     scene_dirs: List[Path] = []
     for scene_dir in sorted(path for path in root.iterdir() if path.is_dir()):
         if selected_scene_ids and scene_dir.name not in selected_scene_ids:
+            continue
+        if not selected_scene_ids and SCENE_ID_PATTERN.fullmatch(scene_dir.name) is None:
             continue
         scene_dirs.append(scene_dir)
         if max_scenes is not None and len(scene_dirs) >= max_scenes:
