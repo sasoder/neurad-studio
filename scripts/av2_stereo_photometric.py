@@ -12,7 +12,6 @@ import torch
 from PIL import Image
 
 DEFAULT_TARGET_CAMERAS = ("stereo_front_left", "stereo_front_right")
-DEFAULT_LUT_BINS = 32
 SCENE_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
@@ -91,28 +90,9 @@ def _rgb_to_luminance(rgb: torch.Tensor) -> torch.Tensor:
     return (rgb * weights).sum(dim=-1, keepdim=True)
 
 
-def _apply_lut_to_gray(gray: torch.Tensor, lut_y: torch.Tensor) -> torch.Tensor:
-    lut_y = lut_y.to(dtype=gray.dtype, device=gray.device)
-    gray = torch.clamp(gray, 0.0, 1.0)
-    if lut_y.numel() < 2:
-        raise ValueError("lut_y must contain at least 2 points")
-    position = gray * (lut_y.numel() - 1)
-    idx0 = torch.floor(position).long().clamp(0, lut_y.numel() - 2)
-    idx1 = idx0 + 1
-    frac = position - idx0.to(position.dtype)
-    return (1.0 - frac) * lut_y[idx0] + frac * lut_y[idx1]
-
-
-def _apply_mapping(rgb: torch.Tensor, entry: Dict[str, Any]) -> torch.Tensor:
+def _apply_mapping(rgb: torch.Tensor, scale: float, bias: float, gamma: float) -> torch.Tensor:
     luminance = _rgb_to_luminance(rgb)
-    if entry.get("mapping_type") == "lut":
-        lut_y = torch.as_tensor(entry["lut_y"], dtype=luminance.dtype, device=luminance.device)
-        gray = _apply_lut_to_gray(luminance, lut_y)
-    else:
-        scale = float(entry["scale"])
-        bias = float(entry["bias"])
-        gamma = max(float(entry.get("gamma", 1.0)), 1e-3)
-        gray = torch.clamp(scale * torch.pow(torch.clamp(luminance, 0.0, 1.0), gamma) + bias, 0.0, 1.0)
+    gray = torch.clamp(scale * torch.pow(torch.clamp(luminance, 0.0, 1.0), max(gamma, 1e-3)) + bias, 0.0, 1.0)
     return gray.expand(*rgb.shape[:-1], 3)
 
 
@@ -125,36 +105,35 @@ def _select_indices(num_frames: int, start_frame: int, max_frames: Optional[int]
     return range(start_frame, end_frame)
 
 
-def _fit_mapping(
-    pred_gray: torch.Tensor,
-    gt_gray: torch.Tensor,
-    max_steps: int,
-    learning_rate: float,
-    lut_bins: int,
-) -> Dict[str, Any]:
+def _fit_mapping(pred_gray: torch.Tensor, gt_gray: torch.Tensor, max_steps: int, learning_rate: float) -> Dict[str, float]:
     baseline_mean_l1 = torch.abs(pred_gray - gt_gray).mean().item()
-    if lut_bins < 2:
-        raise ValueError("lut_bins must be >= 2")
-    raw_delta = torch.nn.Parameter(torch.zeros(lut_bins - 1, dtype=torch.float32))
-    optimizer = torch.optim.Adam((raw_delta,), lr=learning_rate)
+    scale_param = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+    bias_param = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+    log_gamma_param = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+    optimizer = torch.optim.Adam((scale_param, bias_param, log_gamma_param), lr=learning_rate)
 
     for _ in range(max_steps):
-        delta = torch.nn.functional.softplus(raw_delta) + 1e-6
-        lut_y = torch.cat((torch.zeros(1, dtype=delta.dtype), torch.cumsum(delta, dim=0)), dim=0)
-        lut_y = lut_y / lut_y[-1].clamp_min(1e-6)
-        mapped = _apply_lut_to_gray(pred_gray, lut_y)
+        gamma = torch.exp(log_gamma_param)
+        mapped = torch.clamp(
+            scale_param * torch.pow(torch.clamp(pred_gray, 0.0, 1.0), gamma) + bias_param,
+            0.0,
+            1.0,
+        )
         loss = torch.abs(mapped - gt_gray).mean()
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
-    delta = torch.nn.functional.softplus(raw_delta.detach()) + 1e-6
-    lut_y = torch.cat((torch.zeros(1, dtype=delta.dtype), torch.cumsum(delta, dim=0)), dim=0)
-    lut_y = lut_y / lut_y[-1].clamp_min(1e-6)
-    fitted_mean_l1 = torch.abs(_apply_lut_to_gray(pred_gray, lut_y) - gt_gray).mean().item()
+    scale = float(scale_param.detach().item())
+    bias = float(bias_param.detach().item())
+    gamma = float(torch.exp(log_gamma_param.detach()).item())
+    fitted_mean_l1 = torch.abs(
+        torch.clamp(scale * torch.pow(torch.clamp(pred_gray, 0.0, 1.0), gamma) + bias, 0.0, 1.0) - gt_gray
+    ).mean().item()
     return {
-        "mapping_type": "lut",
-        "lut_y": [float(v) for v in lut_y.tolist()],
+        "scale": scale,
+        "bias": bias,
+        "gamma": gamma,
         "baseline_mean_l1": baseline_mean_l1,
         "fitted_mean_l1": fitted_mean_l1,
     }
@@ -242,24 +221,19 @@ def fit_command(args: argparse.Namespace) -> None:
             sample_idx = torch.randperm(pred_gray.numel())[: args.max_total_samples_per_camera]
             pred_gray = pred_gray[sample_idx]
             gt_gray = gt_gray[sample_idx]
-        fit = _fit_mapping(
-            pred_gray,
-            gt_gray,
-            max_steps=args.max_steps,
-            learning_rate=args.learning_rate,
-            lut_bins=args.lut_bins,
-        )
+        fit = _fit_mapping(pred_gray, gt_gray, max_steps=args.max_steps, learning_rate=args.learning_rate)
         entries[target_camera] = {
             "appearance_sensor": args.appearance_sensor,
-            "mapping_type": fit["mapping_type"],
-            "lut_y": fit["lut_y"],
+            "scale": fit["scale"],
+            "bias": fit["bias"],
+            "gamma": fit["gamma"],
             "baseline_mean_l1": fit["baseline_mean_l1"],
             "fitted_mean_l1": fit["fitted_mean_l1"],
             "num_scenes": len(camera_samples[target_camera]["scene_ids"]),
             "num_frames": camera_samples[target_camera]["num_frames"],
         }
         print(
-            f"{target_camera}: lut_bins={args.lut_bins}, "
+            f"{target_camera}: scale={fit['scale']:.6f}, bias={fit['bias']:.6f}, gamma={fit['gamma']:.6f}, "
             f"mean L1 {fit['baseline_mean_l1']:.6f} -> {fit['fitted_mean_l1']:.6f}"
         )
 
@@ -278,7 +252,6 @@ def fit_command(args: argparse.Namespace) -> None:
             "max_frames": args.max_frames,
             "sample_pixels_per_frame": args.sample_pixels_per_frame,
             "max_total_samples_per_camera": args.max_total_samples_per_camera,
-            "lut_bins": args.lut_bins,
             "max_steps": args.max_steps,
             "learning_rate": args.learning_rate,
         },
@@ -315,7 +288,12 @@ def apply_command(args: argparse.Namespace) -> None:
                     continue
 
                 rgb = _load_rgb_image(source_path)
-                mapped = _apply_mapping(rgb, entry)
+                mapped = _apply_mapping(
+                    rgb,
+                    scale=float(entry["scale"]),
+                    bias=float(entry["bias"]),
+                    gamma=float(entry.get("gamma", 1.0)),
+                )
                 image = (mapped.numpy() * 255.0).clip(0, 255).astype(np.uint8)
                 Image.fromarray(image).save(target_path)
 
@@ -343,7 +321,6 @@ def build_parser() -> argparse.ArgumentParser:
     fit_parser.add_argument("--max-frames", type=int, default=None)
     fit_parser.add_argument("--sample-pixels-per-frame", type=int, default=1000)
     fit_parser.add_argument("--max-total-samples-per-camera", type=int, default=500000)
-    fit_parser.add_argument("--lut-bins", type=int, default=DEFAULT_LUT_BINS)
     fit_parser.add_argument("--max-steps", type=int, default=300)
     fit_parser.add_argument("--learning-rate", type=float, default=0.03)
     fit_parser.set_defaults(func=fit_command)
