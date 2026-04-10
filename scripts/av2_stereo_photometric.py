@@ -80,6 +80,16 @@ def _load_rgb_image(image_path: Path, size: Optional[Tuple[int, int]] = None, cr
     return image_tensor
 
 
+def _crop_bottom(image: torch.Tensor, crop_bottom_px: int) -> torch.Tensor:
+    if crop_bottom_px <= 0:
+        return image
+    if crop_bottom_px >= image.shape[0]:
+        raise ValueError(
+            f"crop_bottom_px={crop_bottom_px} must be smaller than image height={image.shape[0]}"
+        )
+    return image[:-crop_bottom_px, :, :]
+
+
 def _extract_grayscale_target(image: torch.Tensor) -> torch.Tensor:
     if image.shape[-1] == 1:
         return image
@@ -293,6 +303,8 @@ def fit_command(args: argparse.Namespace) -> None:
                     size=(pred_rgb.shape[0], pred_rgb.shape[1]),
                     crop_to_size=True,
                 )
+                pred_rgb = _crop_bottom(pred_rgb, args.fit_crop_bottom_px)
+                gt_rgb = _crop_bottom(gt_rgb, args.fit_crop_bottom_px)
 
                 pred_gray = _rgb_to_luminance(pred_rgb).reshape(-1)
                 gt_gray = _extract_grayscale_target(gt_rgb).reshape(-1)
@@ -374,6 +386,7 @@ def fit_command(args: argparse.Namespace) -> None:
             "max_frames": args.max_frames,
             "sample_pixels_per_frame": args.sample_pixels_per_frame,
             "max_total_samples_per_camera": args.max_total_samples_per_camera,
+            "fit_crop_bottom_px": args.fit_crop_bottom_px,
             "mapping_mode": args.mapping_mode,
             "lut_bins": args.lut_bins if args.mapping_mode == "lut" else None,
             "max_steps": args.max_steps,
@@ -441,6 +454,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit_parser.add_argument("--max-frames", type=int, default=None)
     fit_parser.add_argument("--sample-pixels-per-frame", type=int, default=1000)
     fit_parser.add_argument("--max-total-samples-per-camera", type=int, default=500000)
+    fit_parser.add_argument("--fit-crop-bottom-px", type=int, default=0)
     fit_parser.add_argument("--max-steps", type=int, default=300)
     fit_parser.add_argument("--learning-rate", type=float, default=0.03)
     fit_parser.set_defaults(func=fit_command, mapping_mode="global", lut_bins=DEFAULT_LUT_BINS)
@@ -459,6 +473,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit_global_parser.add_argument("--max-frames", type=int, default=None)
     fit_global_parser.add_argument("--sample-pixels-per-frame", type=int, default=1000)
     fit_global_parser.add_argument("--max-total-samples-per-camera", type=int, default=500000)
+    fit_global_parser.add_argument("--fit-crop-bottom-px", type=int, default=0)
     fit_global_parser.add_argument("--max-steps", type=int, default=300)
     fit_global_parser.add_argument("--learning-rate", type=float, default=0.03)
     fit_global_parser.set_defaults(func=fit_command, mapping_mode="global", lut_bins=DEFAULT_LUT_BINS)
@@ -477,6 +492,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit_lut_parser.add_argument("--max-frames", type=int, default=None)
     fit_lut_parser.add_argument("--sample-pixels-per-frame", type=int, default=1000)
     fit_lut_parser.add_argument("--max-total-samples-per-camera", type=int, default=500000)
+    fit_lut_parser.add_argument("--fit-crop-bottom-px", type=int, default=0)
     fit_lut_parser.add_argument("--lut-bins", type=int, default=DEFAULT_LUT_BINS)
     fit_lut_parser.add_argument("--max-steps", type=int, default=300)
     fit_lut_parser.add_argument("--learning-rate", type=float, default=0.03)

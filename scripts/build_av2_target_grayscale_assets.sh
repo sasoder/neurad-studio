@@ -6,8 +6,7 @@ usage() {
 Build the non-luminance grayscale assets needed for stereo-transfer runs.
 
 This script:
-1. Reuses an existing global photometric sidecar if present.
-2. Fits a left/right LUT sidecar from cached stereo renders.
+1. Optionally fits left/right global and LUT sidecars from cached stereo renders.
 3. Applies the global + LUT mappings to:
    - cached stereo renders
    - RFC source-camera train images
@@ -15,26 +14,22 @@ This script:
 
 Outputs created:
 - stereo renders:
-  - stereo_front_left_photometric_lut
-  - stereo_front_right_photometric_lut
+  - stereo_front_left_<suffix>
+  - stereo_front_right_<suffix>
 - RFC source caches:
-  - ring_front_center_photometric_global_left
-  - ring_front_center_photometric_global_right
-  - ring_front_center_photometric_lut_left
-  - ring_front_center_photometric_lut_right
+  - ring_front_center_<suffix>
 - train pickles:
-  - av2_infos_train_stereo_front_left_rendered_photometric_lut.pkl
-  - av2_infos_train_stereo_front_right_rendered_photometric_lut.pkl
-  - av2_infos_train_ring_front_center_photometric_global_left.pkl
-  - av2_infos_train_ring_front_center_photometric_global_right.pkl
-  - av2_infos_train_ring_front_center_photometric_lut_left.pkl
-  - av2_infos_train_ring_front_center_photometric_lut_right.pkl
+  - av2_infos_train_*_<suffix>.pkl
 
 Example:
   bash scripts/build_av2_target_grayscale_assets.sh \
     --renders-root /home/samuelsoderberg/neurad-studio/renders \
     --av2-root /home/samuelsoderberg/neurad-studio/data/av2/sensor \
-    --neurad-root /home/samuelsoderberg/neurad-studio
+    --neurad-root /home/samuelsoderberg/neurad-studio \
+    --fit-global \
+    --fit-lut \
+    --fit-crop-bottom-px 250 \
+    --asset-suffix cropped
 EOF
 }
 
@@ -50,7 +45,10 @@ AV2_ROOT="${NEURAD_ROOT}/data/av2/sensor"
 INFO_DIR="${PROJECT_ROOT}/data"
 GLOBAL_SIDECAR=""
 LUT_SIDECAR=""
+FIT_GLOBAL=false
 FIT_LUT=false
+FIT_CROP_BOTTOM_PX=0
+ASSET_SUFFIX=""
 OVERWRITE=false
 MAX_SCENES=""
 
@@ -84,9 +82,21 @@ while [[ $# -gt 0 ]]; do
       LUT_SIDECAR="$2"
       shift 2
       ;;
+    --fit-global)
+      FIT_GLOBAL=true
+      shift
+      ;;
     --fit-lut)
       FIT_LUT=true
       shift
+      ;;
+    --fit-crop-bottom-px)
+      FIT_CROP_BOTTOM_PX="$2"
+      shift 2
+      ;;
+    --asset-suffix)
+      ASSET_SUFFIX="$2"
+      shift 2
       ;;
     --overwrite)
       OVERWRITE=true
@@ -118,13 +128,38 @@ if [[ "${INFO_DIR}" == "${PROJECT_ROOT_DEFAULT}/data" ]]; then
   INFO_DIR="${PROJECT_ROOT}/data"
 fi
 
+append_suffix() {
+  local base="$1"
+  if [[ -n "${ASSET_SUFFIX}" ]]; then
+    printf '%s_%s' "${base}" "${ASSET_SUFFIX}"
+  else
+    printf '%s' "${base}"
+  fi
+}
+
 if [[ -z "${GLOBAL_SIDECAR}" ]]; then
-  GLOBAL_SIDECAR="${RENDERS_ROOT}/stereo_photometric_global.json"
+  GLOBAL_SIDECAR="${RENDERS_ROOT}/$(append_suffix "stereo_photometric_global").json"
 fi
 
 if [[ -z "${LUT_SIDECAR}" ]]; then
-  LUT_SIDECAR="${RENDERS_ROOT}/stereo_photometric_lut.json"
+  LUT_SIDECAR="${RENDERS_ROOT}/$(append_suffix "stereo_photometric_lut").json"
 fi
+
+STEREO_GLOBAL_SUFFIX="$(append_suffix "photometric_global")"
+STEREO_LUT_SUFFIX="$(append_suffix "photometric_lut")"
+RFC_GLOBAL_LEFT_SUFFIX="$(append_suffix "photometric_global_left")"
+RFC_GLOBAL_RIGHT_SUFFIX="$(append_suffix "photometric_global_right")"
+RFC_LUT_LEFT_SUFFIX="$(append_suffix "photometric_lut_left")"
+RFC_LUT_RIGHT_SUFFIX="$(append_suffix "photometric_lut_right")"
+
+STEREO_LEFT_GLOBAL_PICKLE_SUFFIX="$(append_suffix "stereo_front_left_rendered_photometric_global")"
+STEREO_RIGHT_GLOBAL_PICKLE_SUFFIX="$(append_suffix "stereo_front_right_rendered_photometric_global")"
+STEREO_LEFT_LUT_PICKLE_SUFFIX="$(append_suffix "stereo_front_left_rendered_photometric_lut")"
+STEREO_RIGHT_LUT_PICKLE_SUFFIX="$(append_suffix "stereo_front_right_rendered_photometric_lut")"
+RFC_GLOBAL_LEFT_PICKLE_SUFFIX="$(append_suffix "ring_front_center_photometric_global_left")"
+RFC_GLOBAL_RIGHT_PICKLE_SUFFIX="$(append_suffix "ring_front_center_photometric_global_right")"
+RFC_LUT_LEFT_PICKLE_SUFFIX="$(append_suffix "ring_front_center_photometric_lut_left")"
+RFC_LUT_RIGHT_PICKLE_SUFFIX="$(append_suffix "ring_front_center_photometric_lut_right")"
 
 PHOTOMETRIC_SCRIPT="${NEURAD_ROOT}/scripts/av2_stereo_photometric.py"
 RFC_APPLY_SCRIPT="${NEURAD_ROOT}/scripts/apply_av2_sidecar_to_source_images.py"
@@ -149,6 +184,8 @@ if [[ -n "${MAX_SCENES}" ]]; then
   rfc_apply_args+=(--max-scenes "${MAX_SCENES}")
 fi
 
+fit_args+=(--fit-crop-bottom-px "${FIT_CROP_BOTTOM_PX}")
+
 if [[ "${OVERWRITE}" == "true" ]]; then
   apply_args+=(--overwrite)
   rfc_apply_args+=(--overwrite)
@@ -164,12 +201,24 @@ echo "AV2 root:       ${AV2_ROOT}"
 echo "Info dir:       ${INFO_DIR}"
 echo "Global sidecar: ${GLOBAL_SIDECAR}"
 echo "LUT sidecar:    ${LUT_SIDECAR}"
+echo "Asset suffix:   ${ASSET_SUFFIX:-<none>}"
+echo "Fit crop px:    ${FIT_CROP_BOTTOM_PX}"
 echo "============================================================"
 
-if [[ ! -f "${GLOBAL_SIDECAR}" ]]; then
-  echo "ERROR: global photometric sidecar not found: ${GLOBAL_SIDECAR}" >&2
-  echo "Expected to reuse an existing fitted sidecar for RFC photometric outputs." >&2
-  exit 1
+if [[ "${FIT_GLOBAL}" == "true" || ! -f "${GLOBAL_SIDECAR}" ]]; then
+  echo
+  echo "Fitting global sidecar"
+  python "${PHOTOMETRIC_SCRIPT}" fit-global \
+    --renders-root "${RENDERS_ROOT}" \
+    --output-path "${GLOBAL_SIDECAR}" \
+    --sample-pixels-per-frame 1000 \
+    --max-total-samples-per-camera 200000 \
+    --max-steps 1000 \
+    --learning-rate 0.03 \
+    "${fit_args[@]}"
+else
+  echo
+  echo "Reusing existing global sidecar: ${GLOBAL_SIDECAR}"
 fi
 
 if [[ "${FIT_LUT}" == "true" || ! -f "${LUT_SIDECAR}" ]]; then
@@ -190,10 +239,19 @@ else
 fi
 
 echo
+echo "Applying global mapping to stereo render caches"
+python "${PHOTOMETRIC_SCRIPT}" apply-global \
+  --renders-root "${RENDERS_ROOT}" \
+  --sidecar-path "${GLOBAL_SIDECAR}" \
+  --output-suffix "${STEREO_GLOBAL_SUFFIX}" \
+  "${apply_args[@]}"
+
+echo
 echo "Applying LUT mapping to stereo render caches"
 python "${PHOTOMETRIC_SCRIPT}" apply-lut \
   --renders-root "${RENDERS_ROOT}" \
   --sidecar-path "${LUT_SIDECAR}" \
+  --output-suffix "${STEREO_LUT_SUFFIX}" \
   "${apply_args[@]}"
 
 echo
@@ -205,7 +263,7 @@ python "${RFC_APPLY_SCRIPT}" \
   --output-root "${RENDERS_ROOT}" \
   --sidecar-path "${GLOBAL_SIDECAR}" \
   --entry-camera stereo_front_left \
-  --output-suffix photometric_global_left \
+  --output-suffix "${RFC_GLOBAL_LEFT_SUFFIX}" \
   "${rfc_apply_args[@]}"
 
 python "${RFC_APPLY_SCRIPT}" \
@@ -215,7 +273,7 @@ python "${RFC_APPLY_SCRIPT}" \
   --output-root "${RENDERS_ROOT}" \
   --sidecar-path "${GLOBAL_SIDECAR}" \
   --entry-camera stereo_front_right \
-  --output-suffix photometric_global_right \
+  --output-suffix "${RFC_GLOBAL_RIGHT_SUFFIX}" \
   "${rfc_apply_args[@]}"
 
 echo
@@ -227,7 +285,7 @@ python "${RFC_APPLY_SCRIPT}" \
   --output-root "${RENDERS_ROOT}" \
   --sidecar-path "${LUT_SIDECAR}" \
   --entry-camera stereo_front_left \
-  --output-suffix photometric_lut_left \
+  --output-suffix "${RFC_LUT_LEFT_SUFFIX}" \
   "${rfc_apply_args[@]}"
 
 python "${RFC_APPLY_SCRIPT}" \
@@ -237,7 +295,7 @@ python "${RFC_APPLY_SCRIPT}" \
   --output-root "${RENDERS_ROOT}" \
   --sidecar-path "${LUT_SIDECAR}" \
   --entry-camera stereo_front_right \
-  --output-suffix photometric_lut_right \
+  --output-suffix "${RFC_LUT_RIGHT_SUFFIX}" \
   "${rfc_apply_args[@]}"
 
 echo
@@ -247,60 +305,80 @@ python "${CONVERTER}" \
   --out-dir "${INFO_DIR}" \
   --split train \
   --cameras stereo_front_left \
-  --suffix stereo_front_left_rendered_photometric_lut \
+  --suffix "${STEREO_LEFT_GLOBAL_PICKLE_SUFFIX}" \
   --rendered-images-root "${RENDERS_ROOT}" \
-  --rendered-camera-dir-suffix photometric_lut
+  --rendered-camera-dir-suffix "${STEREO_GLOBAL_SUFFIX}"
 
 python "${CONVERTER}" \
   --av2-root "${AV2_ROOT}" \
   --out-dir "${INFO_DIR}" \
   --split train \
   --cameras stereo_front_right \
-  --suffix stereo_front_right_rendered_photometric_lut \
+  --suffix "${STEREO_RIGHT_GLOBAL_PICKLE_SUFFIX}" \
   --rendered-images-root "${RENDERS_ROOT}" \
-  --rendered-camera-dir-suffix photometric_lut
+  --rendered-camera-dir-suffix "${STEREO_GLOBAL_SUFFIX}"
+
+python "${CONVERTER}" \
+  --av2-root "${AV2_ROOT}" \
+  --out-dir "${INFO_DIR}" \
+  --split train \
+  --cameras stereo_front_left \
+  --suffix "${STEREO_LEFT_LUT_PICKLE_SUFFIX}" \
+  --rendered-images-root "${RENDERS_ROOT}" \
+  --rendered-camera-dir-suffix "${STEREO_LUT_SUFFIX}"
+
+python "${CONVERTER}" \
+  --av2-root "${AV2_ROOT}" \
+  --out-dir "${INFO_DIR}" \
+  --split train \
+  --cameras stereo_front_right \
+  --suffix "${STEREO_RIGHT_LUT_PICKLE_SUFFIX}" \
+  --rendered-images-root "${RENDERS_ROOT}" \
+  --rendered-camera-dir-suffix "${STEREO_LUT_SUFFIX}"
 
 python "${CONVERTER}" \
   --av2-root "${AV2_ROOT}" \
   --out-dir "${INFO_DIR}" \
   --split train \
   --cameras ring_front_center \
-  --suffix ring_front_center_photometric_global_left \
+  --suffix "${RFC_GLOBAL_LEFT_PICKLE_SUFFIX}" \
   --rendered-images-root "${RENDERS_ROOT}" \
-  --rendered-camera-dir-suffix photometric_global_left
+  --rendered-camera-dir-suffix "${RFC_GLOBAL_LEFT_SUFFIX}"
 
 python "${CONVERTER}" \
   --av2-root "${AV2_ROOT}" \
   --out-dir "${INFO_DIR}" \
   --split train \
   --cameras ring_front_center \
-  --suffix ring_front_center_photometric_global_right \
+  --suffix "${RFC_GLOBAL_RIGHT_PICKLE_SUFFIX}" \
   --rendered-images-root "${RENDERS_ROOT}" \
-  --rendered-camera-dir-suffix photometric_global_right
+  --rendered-camera-dir-suffix "${RFC_GLOBAL_RIGHT_SUFFIX}"
 
 python "${CONVERTER}" \
   --av2-root "${AV2_ROOT}" \
   --out-dir "${INFO_DIR}" \
   --split train \
   --cameras ring_front_center \
-  --suffix ring_front_center_photometric_lut_left \
+  --suffix "${RFC_LUT_LEFT_PICKLE_SUFFIX}" \
   --rendered-images-root "${RENDERS_ROOT}" \
-  --rendered-camera-dir-suffix photometric_lut_left
+  --rendered-camera-dir-suffix "${RFC_LUT_LEFT_SUFFIX}"
 
 python "${CONVERTER}" \
   --av2-root "${AV2_ROOT}" \
   --out-dir "${INFO_DIR}" \
   --split train \
   --cameras ring_front_center \
-  --suffix ring_front_center_photometric_lut_right \
+  --suffix "${RFC_LUT_RIGHT_PICKLE_SUFFIX}" \
   --rendered-images-root "${RENDERS_ROOT}" \
-  --rendered-camera-dir-suffix photometric_lut_right
+  --rendered-camera-dir-suffix "${RFC_LUT_RIGHT_SUFFIX}"
 
 echo
 echo "Finished."
 echo "Created / ensured:"
 echo "  - ${LUT_SIDECAR}"
-echo "  - stereo render LUT caches under ${RENDERS_ROOT}/<log>/stereo_front_{left,right}_photometric_lut/"
-echo "  - RFC photometric caches under ${RENDERS_ROOT}/<log>/ring_front_center_photometric_global_{left,right}/"
-echo "  - RFC LUT caches under ${RENDERS_ROOT}/<log>/ring_front_center_photometric_lut_{left,right}/"
+echo "  - ${GLOBAL_SIDECAR}"
+echo "  - stereo render global caches under ${RENDERS_ROOT}/<log>/stereo_front_{left,right}_${STEREO_GLOBAL_SUFFIX}/"
+echo "  - stereo render LUT caches under ${RENDERS_ROOT}/<log>/stereo_front_{left,right}_${STEREO_LUT_SUFFIX}/"
+echo "  - RFC photometric caches under ${RENDERS_ROOT}/<log>/ring_front_center_${RFC_GLOBAL_LEFT_SUFFIX}/ and ..._${RFC_GLOBAL_RIGHT_SUFFIX}/"
+echo "  - RFC LUT caches under ${RENDERS_ROOT}/<log>/ring_front_center_${RFC_LUT_LEFT_SUFFIX}/ and ..._${RFC_LUT_RIGHT_SUFFIX}/"
 echo "  - train pickles in ${INFO_DIR}"
