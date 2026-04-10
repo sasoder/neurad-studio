@@ -41,7 +41,7 @@ EOF
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NEURAD_ROOT_DEFAULT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SCHOOL_ROOT_DEFAULT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-PROJECT_ROOT_DEFAULT="${SCHOOL_ROOT_DEFAULT}/degree-project-work"
+PROJECT_ROOT_DEFAULT="${SCHOOL_ROOT_DEFAULT}/GitHub/degree-project-work"
 
 NEURAD_ROOT="${NEURAD_ROOT_DEFAULT}"
 PROJECT_ROOT="${PROJECT_ROOT_DEFAULT}"
@@ -175,10 +175,15 @@ fi
 if [[ "${FIT_LUT}" == "true" || ! -f "${LUT_SIDECAR}" ]]; then
   echo
   echo "Fitting LUT sidecar"
-  python "${PHOTOMETRIC_SCRIPT}" fit-lut \
-    --renders-root "${RENDERS_ROOT}" \
-    --output-path "${LUT_SIDECAR}" \
-    "${fit_args[@]}"
+python "${PHOTOMETRIC_SCRIPT}" fit-lut \
+  --renders-root "${RENDERS_ROOT}" \
+  --output-path "${LUT_SIDECAR}" \
+  --sample-pixels-per-frame 1000 \
+  --max-total-samples-per-camera 200000 \
+  --max-steps 1000 \
+  --learning-rate 0.03 \
+  "${fit_args[@]}"
+
 else
   echo
   echo "Reusing existing LUT sidecar: ${LUT_SIDECAR}"
