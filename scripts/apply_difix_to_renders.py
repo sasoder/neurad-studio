@@ -29,6 +29,7 @@ from PIL import Image
 DEFAULT_TARGET_CAMERAS = ("stereo_front_left", "stereo_front_right")
 DEFAULT_PROMPT = "remove degradation"
 SCENE_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+DEFAULT_CONDITIONING_SOURCE_ROOT = Path(__file__).resolve().parents[1] / "data" / "av2" / "sensor" / "train"
 
 
 def _collect_scene_dirs(root: Path, scene_ids: Sequence[str], max_scenes: Optional[int]) -> List[Path]:
@@ -60,6 +61,17 @@ def _get_render_frame_path(camera_dir: Path, timestamp_ns: int) -> Path:
         if candidate.exists():
             return candidate
     raise FileNotFoundError(f"Could not find cached render for timestamp {timestamp_ns} in {camera_dir}")
+
+
+def _get_conditioning_frame_path(conditioning_root: Path, scene_id: str, camera_name: str, timestamp_ns: int) -> Path:
+    camera_dir = conditioning_root / scene_id / "sensors" / "cameras" / camera_name
+    for suffix in (".jpg", ".jpeg", ".png"):
+        candidate = camera_dir / f"{timestamp_ns}{suffix}"
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        f"Could not find conditioning frame for timestamp {timestamp_ns} in {camera_dir}"
+    )
 
 
 def _select_indices(num_frames: int, start_frame: int, max_frames: Optional[int]) -> range:
@@ -131,6 +143,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=None,
                         help="Optional inference width. Omit to use the input width rounded down to a multiple of 8.")
     parser.add_argument("--timestep", type=int, default=199)
+    parser.add_argument(
+        "--use-conditioning-source-images",
+        action="store_true",
+        help=(
+            "Use matching AV2 source camera images as the Difix conditioning input instead of the cached render "
+            "frames. Looks up <conditioning-source-root>/<scene>/sensors/cameras/<camera>/<timestamp>.*."
+        ),
+    )
+    parser.add_argument(
+        "--conditioning-source-root",
+        type=Path,
+        default=DEFAULT_CONDITIONING_SOURCE_ROOT,
+        help="Root directory for source conditioning images used with --use-conditioning-source-images.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -144,7 +170,12 @@ def main() -> None:
     scene_dirs = _collect_scene_dirs(args.renders_root, args.scene_ids, args.max_scenes)
     DifixPipeline = _import_difix_pipeline_class(args.difix_root)
 
-    pipe = DifixPipeline.from_pretrained(args.model_id, trust_remote_code=True)
+    pipe = DifixPipeline.from_pretrained(
+        args.model_id,
+        torch_dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    pipe.enable_vae_slicing()
     pipe = pipe.to("cuda")
 
     total_written = 0
@@ -172,7 +203,18 @@ def main() -> None:
                 if target_path.exists() and not args.overwrite:
                     continue
 
-                source_image = Image.open(source_path).convert("RGB")
+                conditioning_path = (
+                    _get_conditioning_frame_path(
+                        args.conditioning_source_root,
+                        scene_dir.name,
+                        target_camera,
+                        timestamp_ns,
+                    )
+                    if args.use_conditioning_source_images
+                    else source_path
+                )
+
+                source_image = Image.open(conditioning_path).convert("RGB")
                 original_size = source_image.size
                 infer_width, infer_height = _resolve_inference_size(source_image, args.width, args.height)
                 output_image = pipe(
@@ -202,6 +244,8 @@ def main() -> None:
                 "timestep": args.timestep,
                 "input_camera_dir_suffix": args.input_camera_dir_suffix,
                 "output_camera_dir_suffix": args.output_camera_dir_suffix,
+                "use_conditioning_source_images": args.use_conditioning_source_images,
+                "conditioning_source_root": str(args.conditioning_source_root),
             }
             (output_dir / "render_manifest.json").write_text(json.dumps(output_manifest, indent=2), encoding="utf-8")
             print(
