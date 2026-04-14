@@ -16,6 +16,7 @@ can reuse the existing LUT + pickle tooling without special cases.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import sys
@@ -70,21 +71,28 @@ def _select_indices(num_frames: int, start_frame: int, max_frames: Optional[int]
     return range(start_frame, end_frame)
 
 
-def _import_difix_model(difix_root: Optional[Path]):
+def _import_difix_pipeline_class(difix_root: Optional[Path]):
     if difix_root is not None:
-        sys.path.insert(0, str(difix_root))
-        sys.path.insert(0, str(difix_root / "src"))
+        pipeline_path = difix_root / "src" / "pipeline_difix.py"
+        if not pipeline_path.exists():
+            raise FileNotFoundError(f"Missing Difix pipeline file: {pipeline_path}")
+
+        spec = importlib.util.spec_from_file_location("difix_pipeline_module", pipeline_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load Difix pipeline module from {pipeline_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.DifixPipeline
 
     try:
-        from model import Difix
+        from pipeline_difix import DifixPipeline  # type: ignore
     except ImportError as exc:
-        root_hint = f" under {difix_root}" if difix_root is not None else ""
         raise ImportError(
-            "Could not import Difix model. Pass --difix-root to a checked-out nv-tlabs/Difix3D repo"
-            f"{root_hint}, or run this script from an environment where its src/ is importable."
+            "Could not import DifixPipeline. Pass --difix-root to a checked-out nv-tlabs/Difix3D repo, "
+            "or install a package that provides pipeline_difix."
         ) from exc
 
-    return Difix
+    return DifixPipeline
 
 
 def _resolve_inference_size(image: Image.Image, requested_width: Optional[int], requested_height: Optional[int]) -> Tuple[int, int]:
@@ -115,8 +123,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-camera-dir-suffix", type=str, default=None,
                         help="Optional input cache suffix, e.g. foo reads <camera>_foo instead of <camera>.")
     parser.add_argument("--output-camera-dir-suffix", type=str, default="difix")
-    parser.add_argument("--model-path", type=Path, required=True,
-                        help="Path to a local Difix checkpoint (.pkl) for the upstream model.py inference path.")
+    parser.add_argument("--model-id", type=str, default="nvidia/difix",
+                        help="Hugging Face model id for the public Difix diffusers pipeline.")
     parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT)
     parser.add_argument("--height", type=int, default=None,
                         help="Optional inference height. Omit to use the input height rounded down to a multiple of 8.")
@@ -134,14 +142,10 @@ def main() -> None:
         raise RuntimeError("Difix inference requires CUDA; run this script on the SSH GPU machine.")
 
     scene_dirs = _collect_scene_dirs(args.renders_root, args.scene_ids, args.max_scenes)
-    Difix = _import_difix_model(args.difix_root)
+    DifixPipeline = _import_difix_pipeline_class(args.difix_root)
 
-    model_path = str(args.model_path)
-    model = Difix(
-        pretrained_path=model_path,
-        timestep=args.timestep,
-    )
-    model.set_eval()
+    pipe = DifixPipeline.from_pretrained(args.model_id, trust_remote_code=True)
+    pipe = pipe.to("cuda")
 
     total_written = 0
     for scene_idx, scene_dir in enumerate(scene_dirs, start=1):
@@ -169,13 +173,19 @@ def main() -> None:
                     continue
 
                 source_image = Image.open(source_path).convert("RGB")
+                original_size = source_image.size
                 infer_width, infer_height = _resolve_inference_size(source_image, args.width, args.height)
-                output_image = model.sample(
-                    source_image,
+                output_image = pipe(
+                    args.prompt,
+                    image=source_image,
+                    num_inference_steps=1,
+                    timesteps=[args.timestep],
+                    guidance_scale=0.0,
                     width=infer_width,
                     height=infer_height,
-                    prompt=args.prompt,
-                )
+                ).images[0]
+                if output_image.size != original_size:
+                    output_image = output_image.resize(original_size, Image.LANCZOS)
                 output_image.save(target_path)
                 written_for_camera += 1
                 total_written += 1
@@ -185,7 +195,7 @@ def main() -> None:
             output_manifest["difix_source_render_dir"] = str(input_dir)
             output_manifest["difix_settings"] = {
                 "difix_root": str(args.difix_root) if args.difix_root is not None else None,
-                "model_path": model_path,
+                "model_id": args.model_id,
                 "prompt": args.prompt,
                 "height": args.height,
                 "width": args.width,

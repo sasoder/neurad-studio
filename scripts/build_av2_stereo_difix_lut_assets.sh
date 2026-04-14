@@ -19,7 +19,6 @@ This script:
 Example:
   bash scripts/build_av2_stereo_difix_lut_assets.sh \
     --difix-root /home/samuelsoderberg/Difix3D \
-    --model-path /home/samuelsoderberg/Difix3D/checkpoints/model.pkl \
     --renders-root /home/samuelsoderberg/neurad-studio/renders \
     --av2-root /home/samuelsoderberg/neurad-studio/data/av2/sensor \
     --project-root /home/samuelsoderberg/GitHub/degree-project-work
@@ -38,7 +37,7 @@ DIFIX_ROOT=""
 LUT_SIDECAR=""
 DIFIX_OUTPUT_SUFFIX="difix"
 LUT_OUTPUT_SUFFIX="difix_photometric_lut_cropped"
-MODEL_PATH=""
+MODEL_ID="nvidia/difix"
 PROMPT="remove degradation"
 HEIGHT=""
 WIDTH=""
@@ -85,8 +84,8 @@ while [[ $# -gt 0 ]]; do
       LUT_OUTPUT_SUFFIX="$2"
       shift 2
       ;;
-    --model-path)
-      MODEL_PATH="$2"
+    --model-id)
+      MODEL_ID="$2"
       shift 2
       ;;
     --prompt)
@@ -131,11 +130,6 @@ done
 
 if [[ -z "${DIFIX_ROOT}" ]]; then
   echo "ERROR: --difix-root is required" >&2
-  exit 1
-fi
-
-if [[ -z "${MODEL_PATH}" ]]; then
-  echo "ERROR: --model-path is required" >&2
   exit 1
 fi
 
@@ -184,7 +178,7 @@ echo "Info dir:           ${INFO_DIR}"
 echo "LUT sidecar:        ${LUT_SIDECAR}"
 echo "Difix suffix:       ${DIFIX_OUTPUT_SUFFIX}"
 echo "LUT output suffix:  ${LUT_OUTPUT_SUFFIX}"
-echo "Model path:         ${MODEL_PATH}"
+echo "Model id:           ${MODEL_ID}"
 echo "Prompt:             ${PROMPT}"
 echo "Resolution override:${WIDTH:+ ${WIDTH}x${HEIGHT}}${WIDTH:- <auto from each input image>}"
 echo "Timestep:           ${TIMESTEP}"
@@ -195,7 +189,7 @@ difix_args=(
   --renders-root "${RENDERS_ROOT}"
   --difix-root "${DIFIX_ROOT}"
   --output-camera-dir-suffix "${DIFIX_OUTPUT_SUFFIX}"
-  --model-path "${MODEL_PATH}"
+  --model-id "${MODEL_ID}"
   --prompt "${PROMPT}"
   --timestep "${TIMESTEP}"
   "${common_scene_args[@]}"
