@@ -61,6 +61,12 @@ def _get_render_frame_path(camera_dir: Path, timestamp_ns: int) -> Path:
     raise FileNotFoundError(f"Could not find cached render for timestamp {timestamp_ns} in {camera_dir}")
 
 
+def _resolve_camera_dir(scene_dir: Path, camera_name: str, input_camera_dir_suffix: Optional[str]) -> Path:
+    if input_camera_dir_suffix:
+        return scene_dir / f"{camera_name}_{input_camera_dir_suffix}"
+    return scene_dir / camera_name
+
+
 def _load_rgb_image(image_path: Path, size: Optional[Tuple[int, int]] = None, crop_to_size: bool = False) -> torch.Tensor:
     image = np.asarray(Image.open(image_path), dtype=np.float32)
     if image.ndim == 2:
@@ -409,7 +415,7 @@ def apply_command(args: argparse.Namespace) -> None:
             if target_camera not in entries:
                 raise ValueError(f"Sidecar does not contain an entry for {target_camera}")
 
-            camera_dir = scene_dir / target_camera
+            camera_dir = _resolve_camera_dir(scene_dir, target_camera, args.input_camera_dir_suffix)
             output_dir = scene_dir / f"{target_camera}_{args.output_suffix}"
             output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -434,6 +440,7 @@ def apply_command(args: argparse.Namespace) -> None:
             output_manifest["used_photometric_mapping"] = True
             output_manifest["photometric_sidecar"] = str(args.sidecar_path)
             output_manifest["source_render_dir"] = str(camera_dir)
+            output_manifest["input_camera_dir_suffix"] = args.input_camera_dir_suffix
             (output_dir / "render_manifest.json").write_text(json.dumps(output_manifest, indent=2), encoding="utf-8")
 
     print(f"Applied stereo photometric mapping from {args.sidecar_path}")
@@ -506,6 +513,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser.add_argument("--max-scenes", type=int, default=None)
     apply_parser.add_argument("--start-frame", type=int, default=0)
     apply_parser.add_argument("--max-frames", type=int, default=None)
+    apply_parser.add_argument("--input-camera-dir-suffix", type=str, default=None)
     apply_parser.add_argument("--output-suffix", type=str, default="photometric")
     apply_parser.add_argument("--overwrite", action="store_true")
     apply_parser.set_defaults(func=apply_command, expected_mapping_type=None)
@@ -521,6 +529,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply_global_parser.add_argument("--max-scenes", type=int, default=None)
     apply_global_parser.add_argument("--start-frame", type=int, default=0)
     apply_global_parser.add_argument("--max-frames", type=int, default=None)
+    apply_global_parser.add_argument("--input-camera-dir-suffix", type=str, default=None)
     apply_global_parser.add_argument("--output-suffix", type=str, default="photometric_global")
     apply_global_parser.add_argument("--overwrite", action="store_true")
     apply_global_parser.set_defaults(func=apply_command, expected_mapping_type="global")
@@ -536,6 +545,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply_lut_parser.add_argument("--max-scenes", type=int, default=None)
     apply_lut_parser.add_argument("--start-frame", type=int, default=0)
     apply_lut_parser.add_argument("--max-frames", type=int, default=None)
+    apply_lut_parser.add_argument("--input-camera-dir-suffix", type=str, default=None)
     apply_lut_parser.add_argument("--output-suffix", type=str, default="photometric_lut")
     apply_lut_parser.add_argument("--overwrite", action="store_true")
     apply_lut_parser.set_defaults(func=apply_command, expected_mapping_type="lut")
